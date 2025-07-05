@@ -103,6 +103,9 @@ typedef struct {
     uint16_t *color;
 } FrameSlot;
 
+/* максимальное количество слотов задаётся константой MAX_SLOTS */
+#define MAX_SLOTS 8
+
 typedef struct {
     /* размеры экрана */
     int w,h;
@@ -114,8 +117,11 @@ typedef struct {
     FrameSlot slot[MAX_SLOTS];
     uint8_t  *bigmem;
     size_t    bigmem_sz;
-    /* X11 */
-    Display  *dpy; Window root; XImage *ximg; XShmSegmentInfo shm;
+    /* X11: по одному XShmImage на слот */
+    Display             *dpy;
+    Window               root;
+    XImage              *ximg[MAX_SLOTS];
+    XShmSegmentInfo      shm[MAX_SLOTS];
 } Ctx;  static Ctx g;
 
 /* ---------- объявления -------------------------------------------------- */
@@ -262,14 +268,12 @@ static void allocate_bigmem(void)
 
     // Для каждого слота:
     //  base
-    //  ├── raw   : [0 .. raw_sz)
     //  ├── quant : [raw_sz .. raw_sz+q_sz)
     //  └── color : [raw_sz+q_sz .. raw_sz+q_sz+col_sz)
-    size_t raw_sz   = (size_t)g.w*g.h*4;                    // ARGB8888
     size_t q_sz     = (size_t)g.w*g.h*2;                    // RGB555
     size_t col_sz   = (size_t)g.node_cnt*sizeof(uint16_t);  // цвет каждого узла
-    size_t per_slot = raw_sz+q_sz+col_sz;                   // один slot
-    g.bigmem_sz     = per_slot*g.slots;                     // все slots
+    size_t per_slot = q_sz + col_sz;                        // один slot
+    g.bigmem_sz     = per_slot * g.slots;                   // все slots
 
     // Один сплошной блок гарантирует, что все указатели живут в одной
     // непрерывной области и кэш-/TLB-дружественны.
@@ -284,13 +288,13 @@ static void allocate_bigmem(void)
     /* Указатели сохраняем в структуру FrameSlot, а состояние */
     /* выставляем в FREE, чтобы поток захвата мог сразу */
     /* занимать первый свободный кадр. */
-    for ( uint32_t i=0; i<g.slots; ++i ) {
-        uint8_t *base = g.bigmem + i*per_slot;
-        g.slot[i] = (FrameSlot) {
-            .st    = FREE,                          // начальное состояние
-            .raw   = base,                          // начало — сырой BGRA
-            .quant = (uint16_t*)(base+raw_sz),      // следом — квант-буфер
-            .color = (uint16_t*)(base+raw_sz+q_sz)  // в конце — массив цветов
+    for (uint32_t i = 0; i < g.slots; ++i) {
+        uint8_t *base = g.bigmem + i * per_slot;
+        g.slot[i] = (FrameSlot){
+            .st    = FREE,                       // // начальное состояние
+            .raw   = (uint8_t*)g.ximg[i]->data,  // raw данные лежат в shm-образе
+            .quant = (uint16_t*)base,            // следом — квант-буфер
+            .color = (uint16_t*)(base + q_sz)    // в конце — массив цветов
         };
     }
 
@@ -310,20 +314,27 @@ static void init_x11(void)
     g.h=DisplayHeight(g.dpy,scr);
     if(!XShmQueryExtension(g.dpy)) die("XShm");
 
-    /* Создаём XImage в разделяемой памяти */
-    g.ximg=XShmCreateImage(g.dpy,DefaultVisual(g.dpy,scr),
-                           DefaultDepth(g.dpy,scr),ZPixmap,
-                           NULL,&g.shm,g.w,g.h);
-    if(!g.ximg) die("XShmCreateImage");
-    g.shm.shmid = shmget(IPC_PRIVATE,
-                         g.ximg->bytes_per_line*g.ximg->height,
-                         IPC_CREAT|0600);
-    if(g.shm.shmid<0) die("shmget");
+    /* Для каждого слота создаём свой XImage/SHM */
+    for(uint32_t i = 0; i < g.slots; ++i) {
+        XShmSegmentInfo *s = &g.shm[i];
+        g.ximg[i] = XShmCreateImage(g.dpy,
+                                    DefaultVisual(g.dpy,scr),
+                                    DefaultDepth(g.dpy,scr),
+                                    ZPixmap,
+                                    NULL, s,
+                                    g.w, g.h);
+        if (!g.ximg[i]) die("XShmCreateImage");
 
-    g.shm.shmaddr = g.ximg->data = shmat(g.shm.shmid,NULL,0);
-    if ( g.shm.shmaddr==(char*)-1 )  die("shmat");
-    if ( !XShmAttach(g.dpy,&g.shm) ) die("XShmAttach");
-    XSync(g.dpy,False);
+        size_t shmsz = g.ximg[i]->bytes_per_line * g.ximg[i]->height;
+        s->shmid = shmget(IPC_PRIVATE, shmsz, IPC_CREAT|0600);
+        if (s->shmid < 0) die("shmget");
+
+        s->shmaddr = g.ximg[i]->data = shmat(s->shmid, NULL, 0);
+        if (s->shmaddr == (char*)-1) die("shmat");
+
+        if (!XShmAttach(g.dpy, s)) die("XShmAttach");
+    }
+    XSync(g.dpy, False);
 
     fprintf(stdout,"[init] X11 %dx%d\n",g.w,g.h);
 }
@@ -448,16 +459,18 @@ static void *capture_thread(void *arg)
         next+=period;
 
         FrameSlot *s = &g.slot[idx];
+
         if ( atomic_load_explicit( &s->st, memory_order_acquire) != FREE ) {
             fprintf( stdout, "[drop] slot %u busy\n", idx);
             idx = (idx + 1) % g.slots;
             continue;
         }
-        if ( !XShmGetImage(g.dpy, g.root, g.ximg, 0, 0, AllPlanes) ) {
+
+        if (!XShmGetImage(g.dpy, g.root, g.ximg[idx], 0, 0, AllPlanes)) {
             fprintf(stderr, "XShmGetImage failed\n");
             continue;
         }
-        memcpy(s->raw, g.ximg->data, (size_t)g.w * g.h * 4);
+
         s->t_start = now_ns();
         atomic_store_explicit(&s->st, RAW_READY, memory_order_release);
         idx = (idx + 1) % g.slots;
