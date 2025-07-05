@@ -436,25 +436,31 @@ static void write_qimg(const FrameSlot *s, const char *fn)
 static void *capture_thread(void *arg)
 {
     (void)arg;
-    const uint64_t period=250000000ull;            /* 250 мс, макс 4 FPS   */
-    uint32_t idx=0; uint64_t next=now_ns();
+    const uint64_t period = 250000000ull;   /* 250 мс, макс 4 FPS   */
+    uint32_t idx = 0;
+    uint64_t next = now_ns();
 
-    while(1){
-        while(now_ns()<next){ struct timespec ts={0,1000000}; nanosleep(&ts,NULL);}
+    while ( 1 ) {
+        while ( now_ns() < next ) {
+            struct timespec ts = {0,1000000};
+            nanosleep(&ts,NULL);
+        }
         next+=period;
 
-        FrameSlot *s=&g.slot[idx];
-        if(atomic_load_explicit(&s->st,memory_order_acquire)!=FREE){
-            fprintf(stdout,"[drop] slot %u busy\n",idx);
-            idx=(idx+1)%g.slots; continue;
+        FrameSlot *s = &g.slot[idx];
+        if ( atomic_load_explicit( &s->st, memory_order_acquire) != FREE ) {
+            fprintf( stdout, "[drop] slot %u busy\n", idx);
+            idx = (idx + 1) % g.slots;
+            continue;
         }
-        if(!XShmGetImage(g.dpy,g.root,g.ximg,0,0,AllPlanes)){
-            fprintf(stderr,"XShmGetImage failed\n"); continue;
+        if ( !XShmGetImage(g.dpy, g.root, g.ximg, 0, 0, AllPlanes) ) {
+            fprintf(stderr, "XShmGetImage failed\n");
+            continue;
         }
-        memcpy(s->raw,g.ximg->data,(size_t)g.w*g.h*4);
-        s->t_start=now_ns();
-        atomic_store_explicit(&s->st,RAW_READY,memory_order_release);
-        idx=(idx+1)%g.slots;
+        memcpy(s->raw, g.ximg->data, (size_t)g.w * g.h * 4);
+        s->t_start = now_ns();
+        atomic_store_explicit(&s->st, RAW_READY, memory_order_release);
+        idx = (idx + 1) % g.slots;
     }
     return NULL;
 }
@@ -466,8 +472,7 @@ static void *worker_thread(void *arg)
 #ifdef HAVE_LIBNUMA
     uintptr_t wid = (uintptr_t)arg;
 #else
-    (void)arg;
-    /* не используется */
+    (void)arg; /* не используется */
 #endif
 
     /* NUMA-pinning  ------------------------------------------------------ */
@@ -493,8 +498,10 @@ static void *worker_thread(void *arg)
             FrameSlot *s = &g.slot[i];
 
             enum slot_state exp = RAW_READY;
-            if (!atomic_compare_exchange_strong(&s->st, &exp, IN_PROGRESS))
-                continue;                       /* не удалось захватить slot */
+            if (!atomic_compare_exchange_strong(&s->st, &exp, IN_PROGRESS)) {
+                /* не удалось захватить slot */
+                continue;
+            }
 
             /* -------- 1. quantize BGRA8888 → RGB555 -------------------- */
             quantize_rgb555(s->raw, s->quant, px_cnt);
@@ -694,6 +701,9 @@ static void *worker_thread(void *arg)
     }
     return NULL;          /* формально */
 }
+
+
+/* ================= serializer_thread =================================== */
 
 static void *serializer_thread(void *arg)
 {
