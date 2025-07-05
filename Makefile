@@ -4,7 +4,7 @@ LIBPNG := -lpng
 XLIBS  := -lX11 -lXext          # нужны только для capture, можно оставить
 
 SRC    := src
-BIN    := capture invert linefinder rectfinder rectfinder2 cclfinder cclfinder16 rectfinder_top15 xcape_pipe
+BIN    := capture invert linefinder rectfinder rectfinder2 cclfinder cclfinder16 rectfinder_top15 xcape_pipe viewer
 
 CXX ?= g++
 
@@ -35,9 +35,11 @@ cclfinder16: src/cclfinder16.cpp
 rectfinder_top15: src/rectfinder_top15.cpp
 	$(CXX) $(CFLAGS) $(OPENCV_CFLAGS) $< -o $@ $(OPENCV_LIBS)
 
-xcape_pipe:
-	$(CC) -O3 -march=native -std=c17 -Wall -Wextra -pthread src/xcap_pipe.c -lXext -lX11 -lnuma -lpng -o xcap_pipe
+xcape_pipe: src/xcape_pipe.c
+	$(CC) -O3 -march=native -std=c17 -Wall -Wextra -pthread $<  -lXext -lX11 -lnuma -lpng -o $@
 
+viewer: src/viewer.c
+	gcc -O2 -std=c17 -Wall -Wextra $< -lpng -o $@
 
 clean:
 	rm -f $(BIN) frame_*.png *_*.png

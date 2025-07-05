@@ -212,32 +212,51 @@ static void build_topology(int w,int h)
     /* Финал: в g.topo лежит полный массив узлов, упорядоченный */
     /* "по месту создания", а в счётчиках — их количество.  */
     fprintf(stdout, "[init] topo: nodes=%u leaves=%u\n",
-            g.node_cnt, g.leaf_cnt);      /* проверка: должны совпасть
-                                             с nodes/leaves, т.е. всё влезло */
+            g.node_cnt, g.leaf_cnt); /* проверка: должны совпасть
+                                        с nodes/leaves, т.е. всё влезло */
 }
 
 /* ═════════════════════════ память и X11 ═══════════════════════════════════ */
 static void allocate_bigmem(void)
 {
-    size_t raw_sz   =(size_t)g.w*g.h*4;
-    size_t q_sz     =(size_t)g.w*g.h*2;
-    size_t col_sz   =(size_t)g.node_cnt*sizeof(uint16_t);
-    size_t per_slot = raw_sz+q_sz+col_sz;
-    g.bigmem_sz     = per_slot*g.slots;
+    /* если нужны строгие 64-байтовые выравнивания для AVX-инструкций, добавьте
+       uintptr_t align = (uintptr_t)base & 63; if(align) base += 64 - align;
+       перед расчётом raw.  */
 
-    g.bigmem = mmap(NULL,g.bigmem_sz,PROT_READ|PROT_WRITE,
-                    MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
-    if(g.bigmem==MAP_FAILED) die("mmap bigmem");
+    // Для каждого слота:
+    //  base
+    //  ├── raw   : [0 .. raw_sz)
+    //  ├── quant : [raw_sz .. raw_sz+q_sz)
+    //  └── color : [raw_sz+q_sz .. raw_sz+q_sz+col_sz)
+    size_t raw_sz   = (size_t)g.w*g.h*4;                    // ARGB8888
+    size_t q_sz     = (size_t)g.w*g.h*2;                    // RGB555
+    size_t col_sz   = (size_t)g.node_cnt*sizeof(uint16_t);  // цвет каждого узла
+    size_t per_slot = raw_sz+q_sz+col_sz;                   // один slot
+    g.bigmem_sz     = per_slot*g.slots;                     // все slots
 
-    for(uint32_t i=0;i<g.slots;++i){
+    // Один сплошной блок гарантирует, что все указатели живут в одной
+    // непрерывной области и кэш-/TLB-дружественны.
+    g.bigmem = mmap(NULL, g.bigmem_sz,
+                    PROT_READ   | PROT_WRITE,
+                    // виртуальное пространство, физические страницы
+                    // "подкачаются" лениво при первом доступе.
+                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if ( g.bigmem == MAP_FAILED ) die("mmap bigmem");
+
+    /* раздаём "нарезки" каждому слоту */
+    /* Указатели сохраняем в структуру FrameSlot, а состояние */
+    /* выставляем в FREE, чтобы поток захвата мог сразу */
+    /* занимать первый свободный кадр. */
+    for ( uint32_t i=0; i<g.slots; ++i ) {
         uint8_t *base = g.bigmem + i*per_slot;
-        g.slot[i]=(FrameSlot){
-            .st    = FREE,
-            .raw   = base,
-            .quant = (uint16_t*)(base+raw_sz),
-            .color = (uint16_t*)(base+raw_sz+q_sz)
+        g.slot[i] = (FrameSlot) {
+            .st    = FREE,                          // начальное состояние
+            .raw   = base,                          // начало — сырой BGRA
+            .quant = (uint16_t*)(base+raw_sz),      // следом — квант-буфер
+            .color = (uint16_t*)(base+raw_sz+q_sz)  // в конце — массив цветов
         };
     }
+
     fprintf(stdout,"[init] bigmem %.1f MiB (per slot %.1f MiB)\n",
             g.bigmem_sz/1048576.0, per_slot/1048576.0);
 }
