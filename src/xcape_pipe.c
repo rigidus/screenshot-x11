@@ -107,11 +107,20 @@ typedef struct {
 } Ctx; static Ctx g;
 
 
+/// Описывает один «остров» смешанных блоков
+typedef struct {
+    int *blocks;   // массив индексов блоков (row*cols + col)
+    int  count;
+    int  cap;
+} Island;
+
 
 /* ---------- объявления -------------------------------------------------- */
 static void allocate_bigmem(void);
 static void init_x11(void);
 static void *capture_thread(void*);
+static void dump_png_rgb(const char *fname, int W, int H, const uint8_t *rgb);
+static void dump_islands_png(const char *fname, const uint8_t *quant, const Island *islands, int island_n);
 static void *worker_thread(void*);
 static void *serializer_thread(void*);
 static void  write_qimg(const FrameSlot*, const char*);
@@ -671,6 +680,210 @@ static void dump_filled_blocks_png(const char *fname,
 }
 
 
+
+
+
+/// Находит все связанные «острова» блоков, у которых block_color==MIXED.
+/// Возвращает массив Island[ *out_n ], сам массив и поля need to be freed by caller.
+static Island* detect_mixed_islands(const uint8_t *block_color,
+                                    int rows, int cols,
+                                    int *out_n)
+{
+    int N = rows * cols;
+    bool *vis = calloc(N, sizeof(bool));
+    Island *list = NULL;
+    int  list_n = 0, list_cap = 0;
+
+    // Вспомогательная очередь для BFS
+    int *queue = malloc(N * sizeof(int));
+
+    for (int idx = 0; idx < N; ++idx) {
+        if (vis[idx] || block_color[idx] != MIXED) continue;
+
+        // начинаем новый остров
+        if (list_n == list_cap) {
+            list_cap = list_cap ? list_cap*2 : 8;
+            list = realloc(list, list_cap * sizeof(Island));
+        }
+        Island *isl = &list[list_n++];
+        isl->count = 0;
+        isl->cap   = 0;
+        isl->blocks = NULL;
+
+        // BFS из idx
+        int qh=0, qt=0;
+        queue[qt++] = idx;
+        vis[idx] = true;
+
+        while (qh < qt) {
+            int cur = queue[qh++];
+
+            // добавляем в остров
+            if (isl->count == isl->cap) {
+                isl->cap = isl->cap ? isl->cap*2 : 16;
+                isl->blocks = realloc(isl->blocks, isl->cap * sizeof(int));
+            }
+            isl->blocks[isl->count++] = cur;
+
+            int r = cur / cols, c = cur % cols;
+            // 4-соседи
+            const int dr[4] = {-1,1,0,0}, dc[4] = {0,0,-1,1};
+            for (int k=0; k<4; ++k) {
+                int nr = r + dr[k], nc = c + dc[k];
+                if (nr<0||nr>=rows||nc<0||nc>=cols) continue;
+                int ni = nr*cols + nc;
+                if (!vis[ni] && block_color[ni]==MIXED) {
+                    vis[ni]=true;
+                    queue[qt++]=ni;
+                }
+            }
+        }
+    }
+
+    free(vis);
+    free(queue);
+    *out_n = list_n;
+    return list;
+}
+
+/// Собирает уникальный набор квантованных цветов внутри одного острова.
+/// quant — полный буфер [padded_h][padded_w],
+/// rows×cols — количество блоков,
+/// BLOCK_SIZE=8.
+/// Возвращает динамический массив цветов, размер palette_n.
+static uint8_t* collect_palette(const uint8_t *quant,
+                                int padded_w,
+                                const Island *isl,
+                                int *palette_n)
+{
+    // максимально 64 цвета
+    bool seen[256] = {0};
+    uint8_t *palette = malloc(256);
+    int pcount = 0;
+
+    for (int i = 0; i < isl->count; ++i) {
+        int b = isl->blocks[i];
+        int br = b / g.block_cols, bc = b % g.block_cols;
+        int y0 = br * BLOCK_SIZE;
+        int x0 = bc * BLOCK_SIZE;
+        for (int dy=0; dy<BLOCK_SIZE; ++dy) {
+            for (int dx=0; dx<BLOCK_SIZE; ++dx) {
+                uint8_t q = quant[(y0+dy)*padded_w + (x0+dx)];
+                if ((q & TRANSP_BIT)==0 && !seen[q]) {
+                    seen[q] = true;
+                    palette[pcount++] = q;
+                }
+            }
+        }
+    }
+    *palette_n = pcount;
+    return palette;
+}
+
+
+
+
+/// Генерация «полупрозрачного» цвета из индекса
+static void pick_island_color(int idx, uint8_t *r, uint8_t *g, uint8_t *b) {
+    // Простой хеш: меняем компоненты по-разному
+    *r = (uint8_t)( 50 + (idx * 37) % 156 );
+    *g = (uint8_t)(100 + (idx * 59) % 156 );
+    *b = (uint8_t)(150 + (idx * 83) %  76 );
+}
+
+/// Рисует огибающую рамку заданного острова (сплошной прямоугольник)
+static void draw_island_bbox(uint8_t *rgb, int W, int H,
+                             const Island *isl, int padded_w,
+                             uint8_t rr, uint8_t gg, uint8_t bb)
+{
+    // найдем min/max по x и y среди блоков
+    int minx = W, miny = H, maxx = 0, maxy = 0;
+    for (int i = 0; i < isl->count; ++i) {
+        int b = isl->blocks[i];
+        int by = b / g.block_cols, bx = b % g.block_cols;
+        int x0 = bx * BLOCK_SIZE, y0 = by * BLOCK_SIZE;
+        minx = x0 < minx ? x0 : minx;
+        miny = y0 < miny ? y0 : miny;
+        maxx = (x0 + BLOCK_SIZE - 1) > maxx ? x0 + BLOCK_SIZE - 1 : maxx;
+        maxy = (y0 + BLOCK_SIZE - 1) > maxy ? y0 + BLOCK_SIZE - 1 : maxy;
+    }
+    // ——— Обрезаем рамку по границам изображения ———
+    if (minx < 0) minx = 0;
+    if (miny < 0) miny = 0;
+    if (maxx >= W) maxx = W - 1;
+    if (maxy >= H) maxy = H - 1;
+
+    // топ и низ
+    for (int x = minx; x <= maxx; ++x) {
+        size_t p1 = miny * W + x;
+        size_t p2 = maxy * W + x;
+        rgb[p1*3+0]=rgb[p1*3+1]=rgb[p1*3+2]=0;
+        rgb[p2*3+0]=rgb[p2*3+1]=rgb[p2*3+2]=0;
+    }
+    // лево и право
+    for (int y = miny; y <= maxy; ++y) {
+        size_t p1 = (size_t)y * W + minx;
+        size_t p2 = (size_t)y * W + maxx;
+        rgb[p1*3+0]=rgb[p1*3+1]=rgb[p1*3+2]=0;
+        rgb[p2*3+0]=rgb[p2*3+1]=rgb[p2*3+2]=0;
+    }
+    // заливка полупрозрачным цветом (50% смешение с фоном)
+    for (int i = 0; i < isl->count; ++i) {
+        int b = isl->blocks[i];
+        int by = b / g.block_cols, bx = b % g.block_cols;
+        int x0 = bx * BLOCK_SIZE, y0 = by * BLOCK_SIZE;
+        for (int dy = 0; dy < BLOCK_SIZE; ++dy) {
+            int y = y0 + dy; if (y >= H) break;
+            for (int dx = 0; dx < BLOCK_SIZE; ++dx) {
+                int x = x0 + dx; if (x >= W) break;
+                size_t p = (size_t)y * W + x;
+                // оригинальный фон
+                uint8_t fr = rgb[p*3+0], fg = rgb[p*3+1], fb = rgb[p*3+2];
+                // полупрозрачный слой
+                rgb[p*3+0] = (fr + rr) / 2;
+                rgb[p*3+1] = (fg + gg) / 2;
+                rgb[p*3+2] = (fb + bb) / 2;
+            }
+        }
+    }
+}
+
+
+/// Debug: отрисовать острова поверх квантованного фона
+static void dump_islands_png(const char *fname,
+                             const uint8_t *quant,
+                             const Island *islands,
+                             int island_n)
+{
+    int W = g.w, H = g.h, pw = g.padded_w;
+    // 1) подготовить фон из quant → RGB888
+    uint8_t *rgb = malloc((size_t)W * H * 3);
+    if (!rgb) { perror("malloc"); return; }
+    for (int y = 0; y < H; ++y) {
+        for (int x = 0; x < W; ++x) {
+            uint8_t q = quant[y * pw + x];
+            uint8_t r2 = (q >> 4) & 3;
+            uint8_t g2 = (q >> 2) & 3;
+            uint8_t b2 =  q       & 3;
+            // expand2 = (v<<6)|(v<<4)|(v<<2)|v
+            rgb[((size_t)y*W + x)*3 + 0] = (r2<<6)|(r2<<4)|(r2<<2)|r2;
+            rgb[((size_t)y*W + x)*3 + 1] = (g2<<6)|(g2<<4)|(g2<<2)|g2;
+            rgb[((size_t)y*W + x)*3 + 2] = (b2<<6)|(b2<<4)|(b2<<2)|b2;
+        }
+    }
+    // 2) для каждого острова — pick цвет и рисуем
+    for (int i = 0; i < island_n; ++i) {
+        uint8_t rr, gg, bb;
+        pick_island_color(i, &rr, &gg, &bb);
+        draw_island_bbox(rgb, W, H, &islands[i], pw, rr, gg, bb);
+    }
+    // 3) записать PNG
+    dump_png_rgb(fname, W, H, rgb);
+    free(rgb);
+}
+
+
+
 static void *worker_thread(void *arg)
 {
     /* uintptr_t wid = (uintptr_t)arg; */
@@ -743,6 +956,64 @@ static void *worker_thread(void *arg)
                          i, t1.tv_sec, t1.tv_nsec);
                 dump_filled_blocks_png(ffn, s->quant, s->color);
             }
+
+
+            // 1d) Отладка: найти «острова» MIXED-блоков и собрать для них палитру
+            if (getenv("XCAP_DEBUG_ISLANDS")) {
+                int island_n;
+                Island *islands = detect_mixed_islands(
+                    s->color,
+                    g.block_rows, g.block_cols,
+                    &island_n
+                    );
+                // 1) Печатаем палитры для каждого острова (не освобождаем ещё blocks)
+                for (int isl_i = 0; isl_i < island_n; ++isl_i) {
+                    Island *isl = &islands[isl_i];
+                    int palette_n;
+                    uint8_t *palette = collect_palette(
+                        s->quant,
+                        g.padded_w,
+                        isl,
+                        &palette_n
+                        );
+                    // Выводим размер и содержимое палитры
+                    fprintf(stdout,
+                            "[slot %u] island %d: blocks=%d palette=%d:",
+                            i, isl_i, isl->count, palette_n
+                        );
+                    for (int pi = 0; pi < palette_n; ++pi) {
+                        fprintf(stdout, " %02X", palette[pi]);
+                    }
+                    fprintf(stdout, "\n");
+                    free(palette);
+                    /* free(isl->blocks); */
+                }
+
+                // 2) Дополнительно можно вывести PNG с островами
+                char fn[64];
+                struct timespec t;
+                clock_gettime(CLOCK_REALTIME, &t);
+                snprintf(fn, sizeof(fn), "dbg_islands_%u_%ld.png", i, t.tv_sec);
+                printf("-- out no 1\n");
+
+                dump_islands_png(fn, s->quant, islands, island_n);
+
+                printf("-- out no 2\n");
+
+                // 3) Теперь очищаем все blocks и сам массив islands
+                for (int isl_i = 0; isl_i < island_n; ++isl_i) {
+                    free(islands[isl_i].blocks);
+                }
+
+                printf("-- out no 3\n");
+
+                free(islands);
+
+                printf("-- out no 4\n");
+
+            }
+
+            printf("-- out no 5\n");
 
 
             /* // 2) Отладочный вывод: записать информацию по каждому блоку в файл */

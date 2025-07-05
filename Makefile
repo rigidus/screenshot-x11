@@ -47,6 +47,6 @@ clean:
 	rm dbg_*
 
 dbg:
-	XCAP_DEBUG=1 XCAP_DEBUG_RAW=1 XCAP_DEBUG_QUANT=1 XCAP_DEBUG_FILL=1 ./xcape_pipe --slots=1
+	XCAP_DEBUG=1 XCAP_DEBUG_RAW=1 XCAP_DEBUG_QUANT=1 XCAP_DEBUG_FILL=1 XCAP_DEBUG_ISLANDS=1 ./xcape_pipe --slots=1
 
 .PHONY: all clean
