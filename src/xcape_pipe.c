@@ -539,50 +539,133 @@ void dump_quantized_rgb222_png(const char *fname,
 }
 
 
-/* Отладочный дамп: залитые блоки 8×8
- * Фон — белый, uniform-блоки — свои цвета, смешанные — красные, прозрачные — серые
+/**
+ * dump_filled_blocks_png
+ *
+ * Рисует отладочное изображение, где каждый блок 8×8:
+ * - если block_color == MIXED, внутри блока отображаются
+ *   квантованные пиксели (RGB222 → RGB888);
+ * - иначе блок заливается своим цветом, на нём:
+ *     • левая и верхняя границы — белые,
+ *     • правая и нижняя — чёрные,
+ *     • диагональ ↘ (из TL в BR) — чёрная (алгоритм Брезенхема),
+ *     • диагональ ↙ (из TR в BL) — белая.
  */
-static void dump_filled_blocks_png(const char* fname,
-                                   const uint8_t* block_color)
+
+#ifndef MIN
+#define MIN(a,b) ((a) < (b) ? (a) : (b))
+#endif
+
+static void dump_filled_blocks_png(const char *fname,
+                                   const uint8_t *quant,
+                                   const uint8_t *block_color)
 {
     int W = g.w, H = g.h;
+    int pw = g.padded_w;
+    int bc = g.block_cols, br = g.block_rows;
+
+    // Буфер RGB888
     uint8_t *rgb = malloc((size_t)W * H * 3);
     if (!rgb) { perror("malloc"); return; }
-    // фон — белый
+    // Фон — белый
     memset(rgb, 255, (size_t)W * H * 3);
 
-    for (int by = 0; by < g.block_rows; ++by) {
-        for (int bx = 0; bx < g.block_cols; ++bx) {
-            int idx = by * g.block_cols + bx;
+    // Проход по блокам 8×8
+    for (int by = 0; by < br; ++by) {
+        for (int bx = 0; bx < bc; ++bx) {
+            int idx = by * bc + bx;
             uint8_t c = block_color[idx];
-            uint8_t r8, g8, b8;
+            int x0 = bx * BLOCK_SIZE;
+            int y0 = by * BLOCK_SIZE;
+            int w_blk = MIN(BLOCK_SIZE, W - x0);
+            int h_blk = MIN(BLOCK_SIZE, H - y0);
+
             if (c == MIXED) {
-                r8 = 255; g8 =   0; b8 =   0;  // красный для MIXED
-            } else if (c & TRANSP_BIT) {
-                r8 = 200; g8 = 200; b8 = 200;  // серый для прозрачных
+                // MIXED: рисуем квантованные пиксели
+                for (int dy = 0; dy < h_blk; ++dy) {
+                    for (int dx = 0; dx < w_blk; ++dx) {
+                        uint8_t q = quant[(y0 + dy) * pw + (x0 + dx)];
+                        uint8_t r2 = (q >> 4) & 3;
+                        uint8_t g2 = (q >> 2) & 3;
+                        uint8_t b2 =  q       & 3;
+                        uint8_t r8 = expand2(r2);
+                        uint8_t g8 = expand2(g2);
+                        uint8_t b8 = expand2(b2);
+                        size_t p = (size_t)(y0 + dy) * W + (x0 + dx);
+                        rgb[p*3 + 0] = r8;
+                        rgb[p*3 + 1] = g8;
+                        rgb[p*3 + 2] = b8;
+                    }
+                }
             } else {
+                // UNIFORM: заливка блока своим цветом
                 uint8_t r2 = (c >> 4) & 3;
                 uint8_t g2 = (c >> 2) & 3;
                 uint8_t b2 =  c       & 3;
-                r8 = expand2(r2);
-                g8 = expand2(g2);
-                b8 = expand2(b2);
-            }
-            int x0 = bx * BLOCK_SIZE, y0 = by * BLOCK_SIZE;
-            for (int dy = 0; dy < BLOCK_SIZE; ++dy) {
-                int y = y0 + dy;
-                if (y >= H) break;
-                for (int dx = 0; dx < BLOCK_SIZE; ++dx) {
-                    int x = x0 + dx;
-                    if (x >= W) break;
-                    size_t p = (size_t)y * W + x;
-                    rgb[p*3+0] = r8;
-                    rgb[p*3+1] = g8;
-                    rgb[p*3+2] = b8;
+                uint8_t r8 = expand2(r2);
+                uint8_t g8 = expand2(g2);
+                uint8_t b8 = expand2(b2);
+                // заполнить
+                for (int dy = 0; dy < h_blk; ++dy) {
+                    for (int dx = 0; dx < w_blk; ++dx) {
+                        size_t p = (size_t)(y0 + dy) * W + (x0 + dx);
+                        rgb[p*3 + 0] = r8;
+                        rgb[p*3 + 1] = g8;
+                        rgb[p*3 + 2] = b8;
+                    }
+                }
+                // рамки
+                // верхняя и левая — белые
+                for (int dx = 0; dx < w_blk; ++dx) {
+                    size_t p = (size_t)y0 * W + (x0 + dx);
+                    rgb[p*3+0] = rgb[p*3+1] = rgb[p*3+2] = 255;
+                }
+                for (int dy = 0; dy < h_blk; ++dy) {
+                    size_t p = (size_t)(y0 + dy) * W + x0;
+                    rgb[p*3+0] = rgb[p*3+1] = rgb[p*3+2] = 255;
+                }
+                // нижняя и правая — чёрные
+                for (int dx = 0; dx < w_blk; ++dx) {
+                    size_t p = (size_t)(y0 + h_blk - 1) * W + (x0 + dx);
+                    rgb[p*3+0] = rgb[p*3+1] = rgb[p*3+2] = 0;
+                }
+                for (int dy = 0; dy < h_blk; ++dy) {
+                    size_t p = (size_t)(y0 + dy) * W + (x0 + w_blk - 1);
+                    rgb[p*3+0] = rgb[p*3+1] = rgb[p*3+2] = 0;
+                }
+                // диагональ ↘ (чёрная) — Bresenham
+                {
+                    int dx = 0, dy = 0, err = 0;
+                    while (dx < w_blk && dy < h_blk) {
+                        size_t p = (size_t)(y0 + dy) * W + (x0 + dx);
+                        rgb[p*3+0] = rgb[p*3+1] = rgb[p*3+2] = 0;
+                        err += h_blk;
+                        if (err >= w_blk) {
+                            err -= w_blk;
+                            ++dy;
+                        }
+                        ++dx;
+                    }
+                }
+                // диагональ ↙ (из TR в BL, белая) — Bresenham
+                {
+                    int dx = 0, dy = 0, err = 0;
+                    while (dx < w_blk && dy < h_blk) {
+                        size_t p = (size_t)(y0 + dy) * W + (x0 + w_blk - 1 - dx);
+                        rgb[p*3+0] = rgb[p*3+1] = rgb[p*3+2] = 255;
+                        err += h_blk;
+                        if (err >= w_blk) {
+                            err -= w_blk;
+                            ++dy;
+                        }
+                        ++dx;
+                    }
                 }
             }
         }
     }
+
+    // Сохраняем PNG
     dump_png_rgb(fname, W, H, rgb);
     free(rgb);
 }
@@ -658,7 +741,7 @@ static void *worker_thread(void *arg)
                 snprintf(ffn, sizeof(ffn),
                          "dbg_fill_%u_%ld_%09ld.png",
                          i, t1.tv_sec, t1.tv_nsec);
-                dump_filled_blocks_png(ffn, s->color);
+                dump_filled_blocks_png(ffn, s->quant, s->color);
             }
 
 
