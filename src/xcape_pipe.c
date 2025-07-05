@@ -87,7 +87,12 @@ static inline uint64_t now_ns(void)
 static void die(const char *m){ perror(m); exit(EXIT_FAILURE); }
 
 /* ---------- структуры --------------------------------------------------- */
-typedef struct { uint16_t x0,y0,x1,y1; uint32_t L,R; } RectTopo;
+typedef struct {
+    uint16_t x0,y0,x1,y1;
+    uint32_t L,R;
+    uint32_t P;               /* <- индекс родителя, UINT32_MAX для корня */
+} RectTopo;
+
 enum slot_state { FREE, RAW_READY, IN_PROGRESS, QUANT_DONE, SERIALIZING };
 
 typedef struct {
@@ -143,7 +148,8 @@ push_rect(uint16_t x0, uint16_t y0,
         .x0 = x0, .y0 = y0,
         .x1 = x1, .y1 = y1,
         .L  = UINT32_MAX,                    /* пока нет потомков   */
-        .R  = UINT32_MAX
+        .R  = UINT32_MAX,
+        .P  = UINT32_MAX
     };
     return idx;                              /* вернуть индекс узла */
 }
@@ -177,9 +183,11 @@ static void split_recursive(uint32_t idx)
         r = push_rect(g.topo[idx].x0, m,              g.topo[idx].x1, g.topo[idx].y1);
     }
 
-    /* записываем индексы детей _после_ возможного realloc */
+    /* записываем индексы родителя и детей */
+    g.topo[l].P = g.topo[r].P = idx;
     g.topo[idx].L = l;
     g.topo[idx].R = r;
+
 
     split_recursive(l); // рекурсивно делим левый
     split_recursive(r); // и правый прямоугольники
@@ -382,11 +390,20 @@ static void analyse_leaves(const uint16_t *quant,uint16_t *color)
 }
 static void merge_uniform_nodes(uint16_t *color)
 {
-    for(int32_t i=(int32_t)g.node_cnt-1;i>=0;--i){
-        const RectTopo *r=&g.topo[i]; if(r->L==UINT32_MAX) continue;
-        uint16_t cL=color[r->L],cR=color[r->R];
-        color[i]=(cL!=COLOR_MIXED && cL==cR)? cL:COLOR_MIXED;
+    size_t merged = 0;
+    for ( int32_t i = (int32_t)g.node_cnt-1; i>=0; --i ) {
+        const RectTopo *r = &g.topo[i];
+        if ( r->L == UINT32_MAX ) continue;
+        uint16_t cL = color[r->L], cR=color[r->R];
+
+        if (cL != COLOR_MIXED && cL == cR) {
+            color[i] = cL;
+            ++merged;
+        } else {
+            color[i] = COLOR_MIXED;
+        }
     }
+    fprintf(stdout, "[debug] merged nodes = %zu\n", merged);
 }
 
 
@@ -540,8 +557,27 @@ static void *worker_thread(void *arg)
                     /* обойдём все листья и нарисуем диагонали там,
                        где color != COLOR_MIXED                              */
                     for (uint32_t n = 0; n < g.node_cnt; ++n) {
-                        if (g.topo[n].L != UINT32_MAX) continue;      /* не лист */
-                        if (s->color[n] == COLOR_MIXED)       continue;
+                        if (g.topo[n].L != UINT32_MAX)   continue;      /* не лист */
+                        if (s->color[n] == COLOR_MIXED)  continue;
+
+                        /* /\* новый фильтр «родитель уже однороден и совпадает» *\/ */
+                        /* uint32_t p = g.topo[n].P; */
+                        /* while (p != UINT32_MAX && */
+                        /*     s->color[p] != COLOR_MIXED && */
+                        /*     s->color[p] == s->color[n]) */
+                        /*     continue;                                   /\* лист спрятан *\/ */
+
+
+                        /* поиск однородного предка */
+                        uint32_t p = g.topo[n].P;
+                        while (p != UINT32_MAX &&
+                               s->color[p] != COLOR_MIXED &&
+                               s->color[p] == s->color[n])
+                            p = g.topo[p].P;                    /* поднимаемся выше */
+
+                        if (p != UINT32_MAX)                    /* нашли «поглотителя» */
+                            continue;                           /* → этот лист НЕ рисуем */
+
 
                         const RectTopo *r = &g.topo[n];
                         uint32_t w = r->x1 - r->x0;
@@ -588,8 +624,8 @@ static void *worker_thread(void *arg)
 
                     /* ─── подчеркнём объединённые узлы (не листья) ─── */
                     for (uint32_t n = 0; n < g.node_cnt; ++n) {
-                        if (g.topo[n].L == UINT32_MAX) continue;              /* лист пропускаем */
-                        if (s->color[n] == COLOR_MIXED) continue;             /* не объединён   */
+                        if (g.topo[n].L == UINT32_MAX) continue;           /* лист пропускаем */
+                        if (s->color[n] == COLOR_MIXED) continue;          /* не объединён   */
 
                         /* условие «оба потомка совпадают с родителем» уже гарантировано
                            функцией merge_uniform_nodes(), но уточним явно */
@@ -615,6 +651,32 @@ static void *worker_thread(void *arg)
                         for (uint32_t y = r->y0; y < r->y1; ++y){          /* правый */
                             size_t p = (y * g.w + (r->x1-1)) * 3;
                             rgb[p]=255; rgb[p+1]=165; rgb[p+2]=0;
+                        }
+
+                        /* ─── диагональ ↗   (BL → TR) ─── */
+                        uint32_t x0 = r->x0, y0 = r->y0, x1 = r->x1, y1 = r->y1;
+
+                        /* ─── диагональ ↗   (BL → TR) ─── */
+                        uint32_t w = x1 - x0;
+                        uint32_t h = y1 - y0;
+
+                        /* Брезенхэм: идём по X, поднимаемся по Y */
+                        for (uint32_t x = 0, y = h - 1, err = 0;
+                             x < w && y < h; ++x)                           /* y – unsigned, <h всегда true */
+                        {
+                            size_t p = ((y0 + y) * g.w + (x0 + x)) * 3;
+                            rgb[p]   = 255;      /* R */
+                            rgb[p+1] = 165;      /* G */
+                            rgb[p+2] = 0;        /* B */
+
+                            /* классический error-accumulator */
+                            if (h >= w) {                /* "крутая" диагональ */
+                                err += w;
+                                if (err >= (uint)h) { err -= h; if (y) --y; }
+                            } else {                     /* "пологая" */
+                                err += h;
+                                if (err >= (uint)w) { err -= w; if (y) --y; }
+                            }
                         }
                     }
 
