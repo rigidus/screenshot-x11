@@ -539,6 +539,55 @@ void dump_quantized_rgb222_png(const char *fname,
 }
 
 
+/* Отладочный дамп: залитые блоки 8×8
+ * Фон — белый, uniform-блоки — свои цвета, смешанные — красные, прозрачные — серые
+ */
+static void dump_filled_blocks_png(const char* fname,
+                                   const uint8_t* block_color)
+{
+    int W = g.w, H = g.h;
+    uint8_t *rgb = malloc((size_t)W * H * 3);
+    if (!rgb) { perror("malloc"); return; }
+    // фон — белый
+    memset(rgb, 255, (size_t)W * H * 3);
+
+    for (int by = 0; by < g.block_rows; ++by) {
+        for (int bx = 0; bx < g.block_cols; ++bx) {
+            int idx = by * g.block_cols + bx;
+            uint8_t c = block_color[idx];
+            uint8_t r8, g8, b8;
+            if (c == MIXED) {
+                r8 = 255; g8 =   0; b8 =   0;  // красный для MIXED
+            } else if (c & TRANSP_BIT) {
+                r8 = 200; g8 = 200; b8 = 200;  // серый для прозрачных
+            } else {
+                uint8_t r2 = (c >> 4) & 3;
+                uint8_t g2 = (c >> 2) & 3;
+                uint8_t b2 =  c       & 3;
+                r8 = expand2(r2);
+                g8 = expand2(g2);
+                b8 = expand2(b2);
+            }
+            int x0 = bx * BLOCK_SIZE, y0 = by * BLOCK_SIZE;
+            for (int dy = 0; dy < BLOCK_SIZE; ++dy) {
+                int y = y0 + dy;
+                if (y >= H) break;
+                for (int dx = 0; dx < BLOCK_SIZE; ++dx) {
+                    int x = x0 + dx;
+                    if (x >= W) break;
+                    size_t p = (size_t)y * W + x;
+                    rgb[p*3+0] = r8;
+                    rgb[p*3+1] = g8;
+                    rgb[p*3+2] = b8;
+                }
+            }
+        }
+    }
+    dump_png_rgb(fname, W, H, rgb);
+    free(rgb);
+}
+
+
 static void *worker_thread(void *arg)
 {
     /* uintptr_t wid = (uintptr_t)arg; */
@@ -600,6 +649,18 @@ static void *worker_thread(void *arg)
                     g.padded_w, g.padded_h
                     );
             }
+
+            /* 1c) Отладочный дамп: залитые блоки 8×8 */
+            if (getenv("XCAP_DEBUG_FILL")) {
+                char ffn[64];
+                struct timespec t1;
+                clock_gettime(CLOCK_REALTIME, &t1);
+                snprintf(ffn, sizeof(ffn),
+                         "dbg_fill_%u_%ld_%09ld.png",
+                         i, t1.tv_sec, t1.tv_nsec);
+                dump_filled_blocks_png(ffn, s->color);
+            }
+
 
             /* // 2) Отладочный вывод: записать информацию по каждому блоку в файл */
             /* // Имя файла: dbg_blocks_<slot>_<timestamp>.txt */
