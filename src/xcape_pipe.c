@@ -50,6 +50,35 @@
 #define STALL_NS      1000000000ull              /* 1 с */
 #define MAGIC_QIMG    0x51494D47u               /* 'Q''I''M''G' */
 
+
+/* ---- tiny helper: write RGB888 buffer to PNG ------------------------- */
+static void dump_png_rgb(const char *fname, int W, int H, const uint8_t *rgb)
+{
+    FILE *fp = fopen(fname, "wb");
+    if (!fp) { perror("png dump"); return; }
+
+    png_structp png = png_create_write_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
+    png_infop   inf = png_create_info_struct(png);
+    if (!png || !inf || setjmp(png_jmpbuf(png))) { fclose(fp); return; }
+
+    png_init_io(png, fp);
+    png_set_IHDR(png, inf, W, H, 8, PNG_COLOR_TYPE_RGB,
+                 PNG_INTERLACE_NONE, PNG_COMPRESSION_TYPE_DEFAULT, PNG_FILTER_TYPE_DEFAULT);
+    png_write_info(png, inf);
+
+    for (int y = 0; y < H; ++y)
+        png_write_row(png, (png_bytep)(rgb + y * W * 3));
+
+    png_write_end(png, NULL);
+    png_destroy_write_struct(&png, &inf);
+    fclose(fp);
+}
+
+/* --- helper: expand 5-bit to 8-bit (for dumping quant) ---------------- */
+static inline uint8_t expand5(uint16_t v){ return (v<<3)|(v>>2); }
+
+
+
 static inline uint64_t now_ns(void)
 {
     struct timespec ts;  clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -298,13 +327,20 @@ static void quantize_rgb555(const uint8_t *src, uint16_t *dst, size_t px)
 #ifdef __SSE2__
     size_t i=0;
     for(; i+4<=px; i+=4,src+=16,dst+=4){
-        __m128i v=_mm_loadu_si128((const __m128i*)src);          /* BGRA BGRA ... */
-        __m128i r=_mm_srli_epi32(v,16), g=_mm_srli_epi32(v,8), b=v;
-        __m128i rgb=_mm_or_si128(_mm_slli_epi32(_mm_srli_epi32(r,3),10),
-                                 _mm_or_si128(_mm_slli_epi32(_mm_srli_epi32(g,3),5),
-                                              _mm_srli_epi32(b,3)));
-        _mm_storel_epi64((__m128i*)dst,
-                         _mm_packs_epi32(rgb,_mm_setzero_si128()));
+        /* BGRA BGRA …  (little-endian).  Нужно отбросить альфу, оставить
+           ровно 5 младших бит каждой компоненты.                           */
+        __m128i v   = _mm_loadu_si128((const __m128i*)src);
+        __m128i mask= _mm_set1_epi32(0x1F);                   /* 0001 1111b */
+
+        __m128i r5 = _mm_and_si128(_mm_srli_epi32(v,16+3), mask);  /* R >>3 */
+        __m128i g5 = _mm_and_si128(_mm_srli_epi32(v, 8+3), mask);  /* G >>3 */
+        __m128i b5 = _mm_and_si128(_mm_srli_epi32(v,    3), mask); /* B >>3 */
+
+        __m128i rgb = _mm_or_si128(_mm_slli_epi32(r5,10),
+                                   _mm_or_si128(_mm_slli_epi32(g5,5), b5)); /* 0RRRRR0GGGGG0BBBBB */
+
+        /* упаковываем 32-бит → 16-бит, сохраняем 4 пикселя */
+        _mm_storel_epi64((__m128i*)dst, _mm_packs_epi32(rgb,_mm_setzero_si128()));
     }
 #else
     size_t i=0;
@@ -379,10 +415,6 @@ static void write_qimg(const FrameSlot *s, const char *fn)
     fclose(fp);
 }
 
-/* ---------- потоки ------------------------------------------------------ */
-/* … capture_thread(), worker_thread() без функциональных изменений …      */
-/* В конец каждой из трёх функций добавлен `return NULL;`                  */
-
 /* ═════════════════════════ потоки ════════════════════════════════════════ */
 static void *capture_thread(void *arg)
 {
@@ -410,35 +442,195 @@ static void *capture_thread(void *arg)
     return NULL;
 }
 
+/* ================= worker_thread ======================================= */
 static void *worker_thread(void *arg)
 {
-    uintptr_t wid=(uintptr_t)arg;
-    int nodes=numa_num_configured_nodes();
-    if(nodes>0){
-        int node=wid%nodes; numa_run_on_node(node);
-        cpu_set_t m; CPU_ZERO(&m);
-        int cpu_per= sysconf(_SC_NPROCESSORS_ONLN)/nodes;
-        int cid=(wid%cpu_per)+node*cpu_per;
-        CPU_SET(cid,&m);
-        pthread_setaffinity_np(pthread_self(),sizeof(m),&m);
-    }
 
-    const uint32_t px=(uint32_t)g.w*g.h;
-    for(;;){
-        for(uint32_t i=0;i<g.slots;++i){
-            FrameSlot *s=&g.slot[i];
-            enum slot_state exp=RAW_READY;
-            if(atomic_compare_exchange_strong(&s->st,&exp,IN_PROGRESS)){
-                quantize_rgb555(s->raw,s->quant,px);
-                analyse_leaves(s->quant,s->color);
-                merge_uniform_nodes(s->color);
-                atomic_store_explicit(&s->st,QUANT_DONE,memory_order_release);
+#ifdef HAVE_LIBNUMA
+    uintptr_t wid = (uintptr_t)arg;
+#else
+    (void)arg;
+    /* не используется */
+#endif
+
+    /* NUMA-pinning  ------------------------------------------------------ */
+#ifdef HAVE_LIBNUMA
+    int nodes = numa_num_configured_nodes();
+    if (nodes > 0) {
+        int node = wid % nodes;
+        numa_run_on_node(node);
+
+        cpu_set_t m;  CPU_ZERO(&m);
+        int cpus_per = sysconf(_SC_NPROCESSORS_ONLN) / (nodes ?: 1);
+        if (cpus_per < 1) cpus_per = 1;
+        int cid = (wid % cpus_per) + node * cpus_per;
+        CPU_SET(cid, &m);
+        pthread_setaffinity_np(pthread_self(), sizeof m, &m);
+    }
+#endif
+
+    const size_t px_cnt = (size_t)g.w * g.h;
+
+    for (;;) {
+        for (uint32_t i = 0; i < g.slots; ++i) {
+            FrameSlot *s = &g.slot[i];
+
+            enum slot_state exp = RAW_READY;
+            if (!atomic_compare_exchange_strong(&s->st, &exp, IN_PROGRESS))
+                continue;                       /* не удалось захватить slot */
+
+            /* -------- 1. quantize BGRA8888 → RGB555 -------------------- */
+            quantize_rgb555(s->raw, s->quant, px_cnt);
+
+            /* -------- DEBUG-PNG  (пишем один раз на слот) -------------- */
+            if (getenv("XCAP_DEBUG") || i == 0) {
+                /* dump RAW → PNG (один раз) */
+                static _Atomic int dumped_raw[MAX_SLOTS]  = {0};
+                if (!dumped_raw[i]) {
+                    uint8_t *rgb = malloc(px_cnt * 3);
+                    const uint8_t *src = s->raw;
+                    for (size_t p = 0; p < px_cnt; ++p, src += 4) {
+                        rgb[p*3+0] = src[2];   /* R */
+                        rgb[p*3+1] = src[1];   /* G */
+                        rgb[p*3+2] = src[0];   /* B */
+                    }
+                    char fn[64];  snprintf(fn,sizeof fn,"dbg_RAW_%u.png", i);
+                    dump_png_rgb(fn, g.w, g.h, rgb);
+                    free(rgb);
+                    dumped_raw[i] = 1;
+                }
+
+                /* dump QUANT → PNG (один раз) */
+                static _Atomic int dumped_q[MAX_SLOTS] = {0};
+                if (!dumped_q[i]) {
+                    uint8_t *rgb = malloc(px_cnt * 3);
+                    const uint16_t *q = s->quant;
+                    for (size_t p = 0; p < px_cnt; ++p, ++q) {
+                        uint16_t v = *q;
+                        rgb[p*3+0] = expand5((v >> 10) & 0x1F);
+                        rgb[p*3+1] = expand5((v >>  5) & 0x1F);
+                        rgb[p*3+2] = expand5( v        & 0x1F);
+                    }
+                    char fn[64];  snprintf(fn,sizeof fn,"dbg_QUANT_%u.png", i);
+                    dump_png_rgb(fn, g.w, g.h, rgb);
+                    free(rgb);
+                    dumped_q[i] = 1;
+                }
             }
-        }
-        sched_yield();
-    }
 
-    return NULL;
+            /* -------- 2. analyse leaves + merge ------------------------ */
+            analyse_leaves(s->quant, s->color);
+            merge_uniform_nodes(s->color);
+
+
+            /* -------- DEBUG: PNG с пометкой однородных блоков ---------- */
+            if (getenv("XCAP_DEBUG") || i == 0) {
+                static _Atomic int dumped_m[MAX_SLOTS] = {0};
+                if (!dumped_m[i]) {
+                    /* сначала скопируем QUANT→RGB888 в буфер */
+                    uint8_t *rgb = malloc(px_cnt * 3);
+                    const uint16_t *q = s->quant;
+                    for (size_t p = 0; p < px_cnt; ++p, ++q) {
+                        uint16_t v = *q;
+                        rgb[p*3+0] = expand5((v>>10)&0x1F);
+                        rgb[p*3+1] = expand5((v>>5 )&0x1F);
+                        rgb[p*3+2] = expand5( v      &0x1F);
+                    }
+
+                    /* обойдём все листья и нарисуем диагонали там,
+                       где color != COLOR_MIXED                              */
+                    for (uint32_t n = 0; n < g.node_cnt; ++n) {
+                        if (g.topo[n].L != UINT32_MAX) continue;      /* не лист */
+                        if (s->color[n] == COLOR_MIXED)       continue;
+
+                        const RectTopo *r = &g.topo[n];
+                        uint32_t w = r->x1 - r->x0;
+                        uint32_t h = r->y1 - r->y0;
+
+                        /* диагональ ↘   (Bresenham y = (h/w)*x) */
+                        for (uint32_t x = 0, y = 0, err = 0; x < w && y < h; ++x) {
+                            size_t p = ((r->y0 + y) * g.w + (r->x0 + x)) * 3;
+                            rgb[p] = rgb[p+1] = rgb[p+2] = 255;          /* белый  */
+                            err += h;
+                            if (err >= (uint)w) { err -= w; ++y; }
+                        }
+
+                        /* диагональ ↙   (из TR в BL) */
+                        for (uint32_t x = 0, y = 0, err = 0; x < w && y < h; ++x) {
+                            size_t p = ((r->y0 + y) * g.w + (r->x1 - 1 - x)) * 3;
+                            rgb[p] = rgb[p+1] = rgb[p+2] = 0;            /* чёрный */
+                            err += h;
+                            if (err >= (uint)w) { err -= w; ++y; }
+                        }
+
+                        /* верхняя горизонталь (y = y0) – белая */
+                        for (uint32_t x = r->x0; x < r->x1; ++x){
+                            size_t p = (r->y0 * g.w + x) * 3;
+                            rgb[p] = rgb[p+1] = rgb[p+2] = 255;
+                        }
+                        /* нижняя горизонталь (y = y1-1) – чёрная */
+                        for (uint32_t x = r->x0; x < r->x1; ++x){
+                            size_t p = ((r->y1 - 1) * g.w + x) * 3;
+                            rgb[p] = rgb[p+1] = rgb[p+2] = 0;
+                        }
+                        /* левая вертикаль (x = x0) – белая */
+                        for (uint32_t y = r->y0; y < r->y1; ++y){
+                            size_t p = (y * g.w + r->x0) * 3;
+                            rgb[p] = rgb[p+1] = rgb[p+2] = 255;
+                        }
+                        /* правая вертикаль (x = x1-1) – чёрная */
+                        for (uint32_t y = r->y0; y < r->y1; ++y){
+                            size_t p = (y * g.w + (r->x1 - 1)) * 3;
+                            rgb[p] = rgb[p+1] = rgb[p+2] = 0;
+                        }
+
+                    }
+
+                    /* ─── подчеркнём объединённые узлы (не листья) ─── */
+                    for (uint32_t n = 0; n < g.node_cnt; ++n) {
+                        if (g.topo[n].L == UINT32_MAX) continue;              /* лист пропускаем */
+                        if (s->color[n] == COLOR_MIXED) continue;             /* не объединён   */
+
+                        /* условие «оба потомка совпадают с родителем» уже гарантировано
+                           функцией merge_uniform_nodes(), но уточним явно */
+                        if (   s->color[g.topo[n].L] != s->color[n]
+                               || s->color[g.topo[n].R] != s->color[n])
+                            continue;
+
+                        const RectTopo *r = &g.topo[n];
+
+                        /* оранжевая рамка (#FFA500) вокруг объединённого прямоугольника */
+                        for (uint32_t x = r->x0; x < r->x1; ++x){          /* верх */
+                            size_t p = (r->y0 * g.w + x) * 3;
+                            rgb[p]=255; rgb[p+1]=165; rgb[p+2]=0;
+                        }
+                        for (uint32_t x = r->x0; x < r->x1; ++x){          /* низ */
+                            size_t p = ((r->y1-1) * g.w + x) * 3;
+                            rgb[p]=255; rgb[p+1]=165; rgb[p+2]=0;
+                        }
+                        for (uint32_t y = r->y0; y < r->y1; ++y){          /* левый */
+                            size_t p = (y * g.w + r->x0) * 3;
+                            rgb[p]=255; rgb[p+1]=165; rgb[p+2]=0;
+                        }
+                        for (uint32_t y = r->y0; y < r->y1; ++y){          /* правый */
+                            size_t p = (y * g.w + (r->x1-1)) * 3;
+                            rgb[p]=255; rgb[p+1]=165; rgb[p+2]=0;
+                        }
+                    }
+
+                    char fn[64];  snprintf(fn,sizeof fn,"dbg_MARKED_%u.png", i);
+                    dump_png_rgb(fn, g.w, g.h, rgb);
+                    free(rgb);
+                    dumped_m[i] = 1;
+                }
+            }
+
+            /* -------- 3. done ------------------------------------------ */
+            atomic_store_explicit(&s->st, QUANT_DONE, memory_order_release);
+        }
+        sched_yield();    /* отдаём квант, чтобы не крутить CPU всухую */
+    }
+    return NULL;          /* формально */
 }
 
 static void *serializer_thread(void *arg)
