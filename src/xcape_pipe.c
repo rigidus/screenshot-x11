@@ -24,8 +24,8 @@
 #include <png.h>
 #include <numa.h>
 #include <emmintrin.h>
-#include <immintrin.h>    // AVX2 (_mm256_*)
-#include <xmmintrin.h>    // _mm_sfence() для STREAM
+#include <immintrin.h>    // AVX2
+#include <xmmintrin.h>    // _mm_sfence()
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
@@ -42,11 +42,12 @@
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
+#include <stdbool.h>
+
 
 /* ---------- константы и вспомогалки ------------------------------------ */
 #define DEFAULT_SLOTS 4
 #define MAX_SLOTS     8
-#define MIN_LEAF      16
 #define COLOR_MIXED   0xFFFF
 #define PIPE_PATH     "/tmp/screenshot_pipe"
 #define STALL_NS      1000000000ull              /* 1 с */
@@ -61,11 +62,6 @@ static inline uint64_t now_ns(void)
 static void die(const char *m){ perror(m); exit(EXIT_FAILURE); }
 
 /* ---------- структуры --------------------------------------------------- */
-typedef struct {
-    uint16_t x0,y0,x1,y1;
-    uint32_t L,R;
-    uint32_t P;               /* <- индекс родителя, UINT32_MAX для корня */
-} RectTopo;
 
 enum slot_state { FREE, RAW_READY, IN_PROGRESS, QUANT_DONE, SERIALIZING };
 
@@ -206,54 +202,142 @@ static void init_x11(void)
 }
 
 
-/* ═════════════════════════ SIMD RGB888→RGB555 ═════════════════════════════ */
+/* ═════════════════════════ SIMD RGB888→RGB222 ═════════════════════════════ */
 
-// объединённое RGB222→quant + анализ uniform-блока 8×8 ---
-static void quantize_and_analyze(const uint8_t *src,
-                                 uint8_t *quant,
-                                 uint8_t *block_color)
-{
-    int pw = g.padded_w, ph = g.padded_h;
-    int bc = g.block_cols, br = g.block_rows;
-    // flag MIXED = 0xFF, transparent = 0x80
-    for(int i=0; i<br*bc; i++)
-        block_color[i] = 0xFF;
+#define BLOCK_SIZE    8
+#define MIXED         0xFF
+#define TRANSP_BIT    0x80
 
-    size_t pixels = (size_t)ph * pw;
-    size_t i = 0;
 
-    // AVX2: 32 пикселя за проход
-    size_t N = pixels / 32 * 32;
-    __m256i mask_high = _mm256_set1_epi8((char)0xC0); // >>6 & 0x03<<?
-    for(; i < N; i += 32, src += 128, quant += 32) {
-        // загрузка 32×BGRA
-        __m256i v0 = _mm256_loadu_si256((__m256i*)(src+0));
-        __m256i v1 = _mm256_loadu_si256((__m256i*)(src+32));
-        __m256i v2 = _mm256_loadu_si256((__m256i*)(src+64));
-        __m256i v3 = _mm256_loadu_si256((__m256i*)(src+96));
-        // извлекаем R,G,B>>6
-        __m256i r = _mm256_and_si256(_mm256_srli_epi32(v0,16), mask_high);
-        __m256i g = _mm256_and_si256(_mm256_srli_epi32(v0, 8), mask_high);
-        __m256i b = _mm256_and_si256( v0            , mask_high);
-        // pack в байты: R|G>>2|B>>4, старший бит=0=>opaque
-        __m256i rg  = _mm256_or_si256(r, _mm256_srli_epi32(g, 2));
-        __m256i rgb = _mm256_or_si256(rg, _mm256_srli_epi32(b, 4));
-        __m256i out = _mm256_packus_epi32(rgb, _mm256_setzero_si256());
-        out = _mm256_permute4x64_epi64(out, 0xD8);
-        // non-temporal store
-        _mm256_stream_si256((__m256i*)quant, out);
-        // здесь можно врезать логику анализа блока 8×8:
-        // для каждого из 32 пикселей вычислить его координаты,
-        // номер блока и сравнить с первым значением block_color[blk],
-        // если не равны — block_color[blk]=0xFF (MIXED).
+// Проверка поддержки AVX2 (разовая, в init)
+static bool have_avx2(void) {
+    uint32_t a, b, c, d;
+    __asm__ volatile(
+        "cpuid\n\t"
+        : "=a"(a), "=b"(b), "=c"(c), "=d"(d)
+        : "a"(0), "c"(0)
+        );
+    // Узнаём feature bits через CPUID leaf 7 subleaf 0
+    __asm__ volatile(
+        "cpuid\n\t"
+        : "=a"(a), "=b"(b), "=c"(c), "=d"(d)
+        : "a"(7), "c"(0)
+        );
+    return (b & (1 << 5)) != 0; // AVX2 bit in EBX
+}
+
+// Расширение 2-бит → 8-бит
+static inline uint8_t expand2(uint8_t v) {
+    return (uint8_t)((v << 6) | (v << 4) | (v << 2) | v);
+}
+
+static void quantize_and_analyze(
+    const uint8_t *src0,     // ARGB8888, stride = w*4
+    uint8_t       *quant,    // буфер [padded_w * padded_h]
+    uint8_t       *block_color, // буфер [block_count]
+    int             w,
+    int             h
+    ) {
+    int pw = g.padded_w;
+    int ph = g.padded_h;
+    int bc = g.block_cols;
+    int br = g.block_rows;
+
+    // Инициализация цветов блоков
+    for (int i = 0; i < br * bc; ++i) {
+        block_color[i] = MIXED;
     }
-    // хвост
-    for(; i < pixels; ++i, src += 4, ++quant) {
-        uint8_t q = ((src[2]>>6)<<4) | ((src[1]>>6)<<2) | (src[0]>>6);
-        _mm_stream_si32((int*)quant, q);
-        // та же проверка блока...
+
+    // Обход по строкам: отдельно для src (ширина w) и quant (ширина pw)
+    for (int y = 0; y < ph; ++y) {
+        const uint8_t *row_src = src0 + (size_t)y * w * 4;
+        uint8_t       *row_q   = quant + (size_t)y * pw;
+        int x = 0;
+
+        // --- векторное квантование ---
+        if (have_avx2()) {
+            __m256i mask2 = _mm256_set1_epi32(0xC0);
+            // AVX2: по 8 пикселей
+            for (; x + 8 <= w; x += 8) {
+                __m256i pix = _mm256_loadu_si256((__m256i*)(row_src + x*4));
+                __m256i r = _mm256_and_si256(_mm256_srli_epi32(pix,16), mask2);
+                __m256i g2= _mm256_and_si256(_mm256_srli_epi32(pix, 8), mask2);
+                __m256i b = _mm256_and_si256(pix,               mask2);
+                __m256i rg = _mm256_or_si256(r, _mm256_srli_epi32(g2,2));
+                __m256i rgb= _mm256_or_si256(rg, _mm256_srli_epi32(b,4));
+                __m128i lo = _mm256_castsi256_si128(rgb);
+                __m128i hi = _mm256_extracti128_si256(rgb,1);
+                __m128i p16 = _mm_packus_epi32(lo, hi);
+                __m128i p8  = _mm_packus_epi16(p16, _mm_setzero_si128());
+                _mm_storel_epi64((__m128i*)(row_q + x), p8);
+            }
+        } else {
+            __m128i mask2s = _mm_set1_epi32(0xC0);
+            // SSE2: по 4 пикселя
+            for (; x + 4 <= w; x += 4) {
+                __m128i pix = _mm_loadu_si128((__m128i*)(row_src + x*4));
+                __m128i r = _mm_and_si128(_mm_srli_epi32(pix,16), mask2s);
+                __m128i g2= _mm_and_si128(_mm_srli_epi32(pix, 8), mask2s);
+                __m128i b = _mm_and_si128(pix,               mask2s);
+                __m128i rg   = _mm_or_si128(r,    _mm_srli_epi32(g2,2));
+                __m128i rgb  = _mm_or_si128(rg,   _mm_srli_epi32(b, 4));
+                __m128i p16  = _mm_packus_epi32(rgb, _mm_setzero_si128());
+                __m128i p8   = _mm_packus_epi16(p16, _mm_setzero_si128());
+                uint32_t v   = _mm_cvtsi128_si32(p8);
+                *(uint32_t*)(row_q + x) = v;
+            }
+        }
+        // остаток по пикселям
+        for (; x < w; ++x) {
+            uint8_t R = row_src[x*4 + 2];
+            uint8_t G = row_src[x*4 + 1];
+            uint8_t B = row_src[x*4 + 0];
+            row_q[x] = (uint8_t)(((R>>6)<<4) | ((G>>6)<<2) | (B>>6));
+        }
+        // padding вправо
+        for (; x < pw; ++x) {
+            row_q[x] = TRANSP_BIT;
+        }
     }
+
+    // гарантируем завершение non-temporal store
     _mm_sfence();
+
+    // --- анализ однородности блоков 8×8 ---
+    for (int by = 0; by < br; ++by) {
+        for (int bx = 0; bx < bc; ++bx) {
+            int idx = by * bc + bx;
+            int sy = by * BLOCK_SIZE;
+            int sx = bx * BLOCK_SIZE;
+            uint8_t base = MIXED;
+
+            // найти первый непустой пиксель
+            for (int dy = 0; dy < BLOCK_SIZE; ++dy) {
+                for (int dx = 0; dx < BLOCK_SIZE; ++dx) {
+                    uint8_t q = quant[(sy+dy)*pw + (sx+dx)];
+                    if (q & TRANSP_BIT) continue;
+                    base = q;
+                    goto found;
+                }
+            }
+        found:
+            if (base == MIXED) {
+                block_color[idx] = TRANSP_BIT;  // полностью прозрачный/mixed
+                continue;
+            }
+            // проверить, не отличаются ли остальные
+            for (int dy = 0; dy < BLOCK_SIZE; ++dy) {
+                for (int dx = 0; dx < BLOCK_SIZE; ++dx) {
+                    uint8_t q = quant[(sy+dy)*pw + (sx+dx)];
+                    if ((q & TRANSP_BIT) || q == base) continue;
+                    base = MIXED;
+                    goto done;
+                }
+            }
+        done:
+            block_color[idx] = base;
+        }
+    }
 }
 
 
@@ -310,46 +394,156 @@ static void write_qimg(const FrameSlot *s, const char *fn)
 }
 
 /* ═════════════════════════ потоки ════════════════════════════════════════ */
+
 static void *capture_thread(void *arg)
 {
     (void)arg;
-    const uint64_t period = 250000000ull;   /* 250 мс, макс 4 FPS   */
+    const uint64_t period = 250000000ull;  // 250 ms → max 4 FPS
     uint32_t idx = 0;
     uint64_t next = now_ns();
 
-    while ( 1 ) {
-        while ( now_ns() < next ) {
-            struct timespec ts = {0,1000000};
-            nanosleep(&ts,NULL);
+    while (1) {
+        // Ждём до следующего кадра
+        while (now_ns() < next) {
+            struct timespec ts = { .tv_sec = 0, .tv_nsec = 1000000 };
+            nanosleep(&ts, NULL);
         }
-        next+=period;
+        next += period;
 
         FrameSlot *s = &g.slot[idx];
-
-        if ( atomic_load_explicit( &s->st, memory_order_acquire) != FREE ) {
-            fprintf( stdout, "[drop] slot %u busy\n", idx);
+        // Если слот занят — дропаем и идём дальше
+        if (atomic_load_explicit(&s->st, memory_order_acquire) != FREE) {
+            fprintf(stdout, "[drop] slot %u busy\n", idx);
             idx = (idx + 1) % g.slots;
             continue;
         }
 
+        // Захватываем изображение прямо в XShm-образ слота
         if (!XShmGetImage(g.dpy, g.root, g.ximg[idx], 0, 0, AllPlanes)) {
             fprintf(stderr, "XShmGetImage failed\n");
+            idx = (idx + 1) % g.slots;
             continue;
         }
 
+        // Помечаем время начала обработки и переводим слот в RAW_READY
         s->t_start = now_ns();
         atomic_store_explicit(&s->st, RAW_READY, memory_order_release);
+
+        // Переходим к следующему слоту
         idx = (idx + 1) % g.slots;
     }
+
+    // никогда не возвращаемся
     return NULL;
 }
 
+
 /* ================= worker_thread ======================================= */
+
+#define EXPAND2(v) ((uint8_t)((v<<6)|(v<<4)|(v<<2)|(v)))
+
+
+/**
+ * dump_png_rgb
+ *
+ * Сохраняет буфер RGB888 (3 байта на пиксель, упаковано по строкам подряд)
+ * в PNG-файл с именем fname.
+ *
+ * @param fname  имя выходного файла
+ * @param W      ширина изображения в пикселях
+ * @param H      высота изображения в пикселях
+ * @param rgb    указатель на буфер размера W*H*3 байт
+ */
+static void dump_png_rgb(const char *fname, int W, int H, const uint8_t *rgb)
+{
+    FILE *fp = fopen(fname, "wb");
+    if (!fp) {
+        perror("dump_png_rgb: fopen");
+        return;
+    }
+
+    png_structp png = png_create_write_struct(
+        PNG_LIBPNG_VER_STRING, NULL, NULL, NULL
+        );
+    if (!png) {
+        fprintf(stderr, "dump_png_rgb: png_create_write_struct failed\n");
+        fclose(fp);
+        return;
+    }
+
+    png_infop info = png_create_info_struct(png);
+    if (!info) {
+        fprintf(stderr, "dump_png_rgb: png_create_info_struct failed\n");
+        png_destroy_write_struct(&png, (png_infopp)NULL);
+        fclose(fp);
+        return;
+    }
+
+    if (setjmp(png_jmpbuf(png))) {
+        fprintf(stderr, "dump_png_rgb: libpng longjmp error\n");
+        png_destroy_write_struct(&png, &info);
+        fclose(fp);
+        return;
+    }
+
+    png_init_io(png, fp);
+
+    // Настройки IHDR
+    png_set_IHDR(
+        png, info,
+        W, H,
+        8,                         // глубина бит на канал
+        PNG_COLOR_TYPE_RGB,
+        PNG_INTERLACE_NONE,
+        PNG_COMPRESSION_TYPE_DEFAULT,
+        PNG_FILTER_TYPE_DEFAULT
+        );
+    png_write_info(png, info);
+
+    // Запись строк
+    for (int y = 0; y < H; ++y) {
+        png_bytep row_ptr = (png_bytep)(rgb + (size_t)y * W * 3);
+        png_write_row(png, row_ptr);
+    }
+
+    png_write_end(png, info);
+    png_destroy_write_struct(&png, &info);
+    fclose(fp);
+}
+
+
+void dump_quantized_rgb222_png(const char *fname,
+                               const uint8_t *quant,
+                               int W, int H,
+                               int padded_w, int padded_h) {
+    padded_h = (int)padded_h;
+    // Выделяем RGB888 буфер
+    uint8_t *rgb = malloc((size_t)W * H * 3);
+    if (!rgb) { perror("malloc"); return; }
+    // Конвертация
+    for (int y = 0; y < H; ++y) {
+        for (int x = 0; x < W; ++x) {
+            uint8_t q = quant[y * padded_w + x];
+            uint8_t r2 = (q>>4)&0x3;
+            uint8_t g2 = (q>>2)&0x3;
+            uint8_t b2 =  q    &0x3;
+            size_t idx = (size_t)y * W + x;
+            rgb[idx*3+0] = EXPAND2(r2);
+            rgb[idx*3+1] = EXPAND2(g2);
+            rgb[idx*3+2] = EXPAND2(b2);
+        }
+    }
+    // Сохраняем PNG
+    dump_png_rgb(fname, W, H, rgb);
+    free(rgb);
+}
+
+
 static void *worker_thread(void *arg)
 {
-    uintptr_t wid = (uintptr_t)arg;
-    size_t px_cnt = (size_t)g.padded_w * g.padded_h;
-    char dbg_fname[128];
+    /* uintptr_t wid = (uintptr_t)arg; */
+    /* size_t px_cnt = (size_t)g.padded_w * g.padded_h; */
+    /* char dbg_fname[128]; */
 
     for (;;) {
         for (uint32_t i = 0; i < g.slots; ++i) {
@@ -358,58 +552,186 @@ static void *worker_thread(void *arg)
             if (!atomic_compare_exchange_strong(&s->st, &exp, IN_PROGRESS))
                 continue;
 
+            // Отладочный вывод сырого скриншота перед обработкой
+            if (getenv("XCAP_DEBUG_RAW")) {
+                // Выделяем буфер RGB888 для сырого кадра
+                uint8_t *raw_rgb = malloc((size_t)g.w * g.h * 3);
+                if (raw_rgb) {
+                    // Конвертация BGRA→RGB
+                    for (int y = 0; y < g.h; ++y) {
+                        for (int x = 0; x < g.w; ++x) {
+                            size_t idx = (size_t)y * g.w + x;
+                            uint8_t *px = s->raw + idx * 4;
+                            raw_rgb[idx*3 + 0] = px[2]; // R
+                            raw_rgb[idx*3 + 1] = px[1]; // G
+                            raw_rgb[idx*3 + 2] = px[0]; // B
+                        }
+                    }
+                    char raw_fn[64];
+                    struct timespec t2; clock_gettime(CLOCK_REALTIME, &t2);
+                    snprintf(raw_fn, sizeof(raw_fn), "dbg_raw_%u_%ld_%09ld.png",
+                             i, t2.tv_sec, t2.tv_nsec);
+                    dump_png_rgb(raw_fn, g.w, g.h, raw_rgb);
+                    free(raw_rgb);
+                }
+            }
+
             // 1) Квантование RGB222 + анализ uniform-блоков 8×8
             quantize_and_analyze(
                 s->raw,      // ARGB8888
                 s->quant,    // RGB222-byte per px
-                s->color     // блоки 8×8: uniform-цвет или MIXED (0xFF)
-                );
+                s->color,     // блоки 8×8: uniform-цвет или MIXED (0xFF)
+                g.w,
+                g.h);
 
-            // 2) Отладочный вывод: записать информацию по каждому блоку в файл
-            // Имя файла: dbg_blocks_<slot>_<timestamp>.txt
-            struct timespec ts;
-            clock_gettime(CLOCK_REALTIME, &ts);
-            snprintf(dbg_fname, sizeof(dbg_fname),
-                     "dbg_blocks_%u_%ld_%09ld.txt",
-                     i, ts.tv_sec, ts.tv_nsec);
 
-            FILE *df = fopen(dbg_fname, "w");
-            if (df) {
-                fprintf(df, "DEBUG BLOCKS SLOT %u (worker %lu)\n", i, (unsigned long)wid);
-                fprintf(df, "Screen: %dx%d, padded: %dx%d\n",
-                        g.w, g.h, g.padded_w, g.padded_h);
-                fprintf(df, "Blocks: %d cols × %d rows = %d total\n\n",
-                        g.block_cols, g.block_rows, g.block_count);
-
-                for (int b = 0; b < g.block_count; ++b) {
-                    uint8_t c = s->color[b];
-                    int col = b % g.block_cols;
-                    int row = b / g.block_cols;
-                    fprintf(df, "Block %3d at [%2d,%2d]: color=0x%02X %s\n",
-                            b, row, col, c,
-                            (c == 0xFF ? "(MIXED)" : "(UNIFORM)"));
-
-                    if (c == 0xFF) {
-                        // Если блок смешанный, вывести все 8×8 квантованных пикселей
-                        fprintf(df, "  Pixels:\n    ");
-                        int base_y = row * 8;
-                        int base_x = col * 8;
-                        for (int y = 0; y < 8; ++y) {
-                            for (int x = 0; x < 8; ++x) {
-                                int idx = (base_y + y) * g.padded_w + (base_x + x);
-                                uint8_t q = s->quant[idx];
-                                fprintf(df, "%02X ", q);
-                            }
-                            if (y < 7) fprintf(df, "\n    ");
-                        }
-                        fprintf(df, "\n");
-                    }
-                }
-                fclose(df);
-            } else {
-                fprintf(stderr, "[worker %lu] failed to open debug file %s: %s\n",
-                        (unsigned long)wid, dbg_fname, strerror(errno));
+            // 1a) Отладочный вывод чистого квантованного изображения RGB222
+            if (getenv("XCAP_DEBUG_QUANT")) {
+                char qfn[64];
+                struct timespec t0;
+                clock_gettime(CLOCK_REALTIME, &t0);
+                snprintf(qfn, sizeof(qfn),
+                         "dbg_quant_%u_%ld_%09ld.png",
+                         i, t0.tv_sec, t0.tv_nsec);
+                dump_quantized_rgb222_png(
+                    qfn,
+                    s->quant,
+                    g.w, g.h,
+                    g.padded_w, g.padded_h
+                    );
             }
+
+            /* // 2) Отладочный вывод: записать информацию по каждому блоку в файл */
+            /* // Имя файла: dbg_blocks_<slot>_<timestamp>.txt */
+            /* struct timespec ts; */
+            /* clock_gettime(CLOCK_REALTIME, &ts); */
+            /* snprintf(dbg_fname, sizeof(dbg_fname), */
+            /*          "dbg_blocks_%u_%ld_%09ld.txt", */
+            /*          i, ts.tv_sec, ts.tv_nsec); */
+
+            /* FILE *df = fopen(dbg_fname, "w"); */
+            /* if (df) { */
+            /*     fprintf(df, "DEBUG BLOCKS SLOT %u (worker %lu)\n", i, (unsigned long)wid); */
+            /*     fprintf(df, "Screen: %dx%d, padded: %dx%d\n", */
+            /*             g.w, g.h, g.padded_w, g.padded_h); */
+            /*     fprintf(df, "Blocks: %d cols × %d rows = %d total\n\n", */
+            /*             g.block_cols, g.block_rows, g.block_count); */
+
+            /*     for (int b = 0; b < g.block_count; ++b) { */
+            /*         uint8_t c = s->color[b]; */
+            /*         int col = b % g.block_cols; */
+            /*         int row = b / g.block_cols; */
+            /*         fprintf(df, "Block %3d at [%2d,%2d]: color=0x%02X %s\n", */
+            /*                 b, row, col, c, */
+            /*                 (c == 0xFF ? "(MIXED)" : "(UNIFORM)")); */
+
+            /*         if (c == 0xFF) { */
+            /*             // Если блок смешанный, вывести все 8×8 квантованных пикселей */
+            /*             fprintf(df, "  Pixels:\n    "); */
+            /*             int base_y = row * 8; */
+            /*             int base_x = col * 8; */
+            /*             for (int y = 0; y < 8; ++y) { */
+            /*                 for (int x = 0; x < 8; ++x) { */
+            /*                     int idx = (base_y + y) * g.padded_w + (base_x + x); */
+            /*                     uint8_t q = s->quant[idx]; */
+            /*                     fprintf(df, "%02X ", q); */
+            /*                 } */
+            /*                 if (y < 7) fprintf(df, "\n    "); */
+            /*             } */
+            /*             fprintf(df, "\n"); */
+            /*         } */
+            /*     } */
+            /*     fclose(df); */
+            /* } else { */
+            /*     fprintf(stderr, "[worker %lu] failed to open debug file %s: %s\n", */
+            /*             (unsigned long)wid, dbg_fname, strerror(errno)); */
+            /* } */
+
+
+            /* // 1a) Отладочный вывод результата в PNG, если установлен XCAP_DEBUG */
+            /* if (getenv("XCAP_DEBUG")) { */
+            /*     // Буфер RGB888 для дампа: ширина*высота*3 */
+            /*     uint8_t *dbg_rgb = malloc((size_t)g.w * g.h * 3); */
+            /*     if (dbg_rgb) { */
+            /*         // (Функция EXPAND2(v)расширяет 2-бит -> 8-бит) */
+            /*         /\* // Заполнение пикселей *\/ */
+            /*         /\* for (int y = 0; y < g.h; ++y) { *\/ */
+            /*         /\*     for (int x = 0; x < g.w; ++x) { *\/ */
+            /*         /\*         int blk = (y/8) * g.block_cols + (x/8); *\/ */
+            /*         /\*         uint8_t bc = s->color[blk]; *\/ */
+            /*         /\*         uint8_t r, gcol, b; *\/ */
+            /*         /\*         if (bc == MIXED) { *\/ */
+            /*         /\*             // Смешанный: показываем оригинальный квант *\/ */
+            /*         /\*             uint8_t q = s->quant[y * g.padded_w + x]; *\/ */
+            /*         /\*             uint8_t r2 = (q>>4)&0x3; *\/ */
+            /*         /\*             uint8_t g2 = (q>>2)&0x3; *\/ */
+            /*         /\*             uint8_t b2 =  q    &0x3; *\/ */
+            /*         /\*             r    = EXPAND2(r2); *\/ */
+            /*         /\*             gcol = EXPAND2(g2); *\/ */
+            /*         /\*             b    = EXPAND2(b2); *\/ */
+            /*         /\*         } else if (bc & TRANSP_BIT) { *\/ */
+            /*         /\*             // Прозрачные: чёрный *\/ */
+            /*         /\*             r = gcol = b = 0; *\/ */
+            /*         /\*         } else { *\/ */
+            /*         /\*             // Однородный: весь блок в цвет bc *\/ */
+            /*         /\*             uint8_t r2 = (bc>>4)&0x3; *\/ */
+            /*         /\*             uint8_t g2 = (bc>>2)&0x3; *\/ */
+            /*         /\*             uint8_t b2 =  bc    &0x3; *\/ */
+            /*         /\*             r    = EXPAND2(r2); *\/ */
+            /*         /\*             gcol = EXPAND2(g2); *\/ */
+            /*         /\*             b    = EXPAND2(b2); *\/ */
+            /*         /\*         } *\/ */
+            /*         /\*         size_t off = ((size_t)y * g.w + x) * 3; *\/ */
+            /*         /\*         dbg_rgb[off + 0] = r; *\/ */
+            /*         /\*         dbg_rgb[off + 1] = gcol; *\/ */
+            /*         /\*         dbg_rgb[off + 2] = b; *\/ */
+            /*         /\*     } *\/ */
+            /*         /\* } *\/ */
+
+            /*         // 1b) Сначала заполняем фон визуализацией квантованного изображения */
+            /*         for (int y = 0; y < g.h; ++y) { */
+            /*             for (int x = 0; x < g.w; ++x) { */
+            /*                 uint8_t q = s->quant[y * g.padded_w + x]; */
+            /*                 uint8_t r2 = (q>>4)&0x3; */
+            /*                 uint8_t g2 = (q>>2)&0x3; */
+            /*                 uint8_t b2 =  q    &0x3; */
+            /*                 uint8_t r = EXPAND2(r2); */
+            /*                 uint8_t gcol = EXPAND2(g2); */
+            /*                 uint8_t b = EXPAND2(b2); */
+            /*                 size_t off = ((size_t)y * g.w + x) * 3; */
+            /*                 dbg_rgb[off + 0] = r; */
+            /*                 dbg_rgb[off + 1] = gcol; */
+            /*                 dbg_rgb[off + 2] = b; */
+            /*             } */
+            /*         } */
+            /*         // Затем накладываем сетку блоков */
+            /*         for (int x = 0; x < g.w; x += 8) { */
+            /*             for (int y = 0; y < g.h; ++y) { */
+            /*                 size_t off = ((size_t)y * g.w + x) * 3; */
+            /*                 // красная вертикаль */
+            /*                 dbg_rgb[off + 0] = 255; dbg_rgb[off + 1] = 0; dbg_rgb[off + 2] = 0; */
+            /*             } */
+            /*         } */
+            /*         for (int y = 0; y < g.h; y += 8) { */
+            /*             for (int x = 0; x < g.w; ++x) { */
+            /*                 size_t off = ((size_t)y * g.w + x) * 3; */
+            /*                 // зелёная горизонталь */
+            /*                 dbg_rgb[off + 0] = 0; dbg_rgb[off + 1] = 255; dbg_rgb[off + 2] = 0; */
+            /*             } */
+            /*         } */
+
+
+/* // Сохранить PNG */
+/*                     char png_fn[64]; */
+/*                     struct timespec ts; */
+/*                     clock_gettime(CLOCK_REALTIME, &ts); */
+/*                     snprintf(png_fn, sizeof(png_fn), */
+/*                              "dbg_blocks_%u_%ld_%09ld.png", */
+/*                              i, ts.tv_sec, ts.tv_nsec); */
+/*                     dump_png_rgb(png_fn, g.w, g.h, dbg_rgb); */
+/*                     free(dbg_rgb); */
+/*                 } */
+/*             } */
 
             // 3) Ставим слот в готовое состояние
             atomic_store_explicit(&s->st, QUANT_DONE, memory_order_release);
@@ -459,38 +781,62 @@ static void *serializer_thread(void *arg)
 
 
 /* ═════════════════════════ main ══════════════════════════════════════════ */
-int main(int argc,char **argv)
-{
-    /* Разбор аргументов: допускается только --slots=N */
-    g.slots=DEFAULT_SLOTS;
-    for(int i=1;i<argc;++i){
-        if(strncmp(argv[i],"--slots=",8)==0){
-            int v=atoi(argv[i]+8);
-            if(v<2||v>MAX_SLOTS){ fprintf(stderr,"slots 2..%d\n",MAX_SLOTS); return 1; }
-            g.slots=v;
-        } else { fprintf(stderr,"unknown opt %s\n",argv[i]); return 1; }
+int main(int argc, char **argv) {
+    // 1. Парсинг аргументов --slots=N
+    g.slots = DEFAULT_SLOTS;
+    for (int i = 1; i < argc; ++i) {
+        if (strncmp(argv[i], "--slots=", 8) == 0) {
+            int v = atoi(argv[i] + 8);
+            if (v < 1 || v > MAX_SLOTS) {
+                fprintf(stderr, "slots 1..%d\n", MAX_SLOTS);
+                return 1;
+            }
+            g.slots = v;
+        } else {
+            fprintf(stderr, "unknown option %s\n", argv[i]);
+            return 1;
+        }
     }
 
-    /* Определяем число рабочих потоков */
-    int cores=sysconf(_SC_NPROCESSORS_ONLN);
-    g.workers=(cores>4)? cores-3 : 1;
+    // 2. Определяем число рабочих потоков
+    int cores = sysconf(_SC_NPROCESSORS_ONLN);
+    g.workers = (cores > 4) ? cores - 3 : 1;
 
-    /* Инициализация X11 и общей топологии */
-    init_x11();
-    /* build_topology(g.w,g.h); */
+    // 3. Инициализация X11 и многосегментный SHM
+    init_x11();  // внутри создаются g.slots XImage+SHM
+
+    // 4. Вычисление размеров блоков 8×8 и паддинга
+    g.block_cols  = (g.w + 7) / 8;
+    g.block_rows  = (g.h + 7) / 8;
+    g.block_count = g.block_cols * g.block_rows;
+    g.padded_w    = g.block_cols * 8;
+    g.padded_h    = g.block_rows * 8;
+
+    fprintf(stdout,
+            "[init] screen %dx%d, padded %dx%d, blocks %dx%d (%d total)\n",
+            g.w, g.h, g.padded_w, g.padded_h,
+            g.block_cols, g.block_rows, g.block_count);
+
+    // 5. Аллокация больших буферов для quant + color
     allocate_bigmem();
 
-    /* Создаём потоки: захвата, сериализатора и воркеры */
+    // 6. Запуск потоков: захват, обработка, сериализация
     pthread_t cap_tid, ser_tid;
-    pthread_t *w_tid=calloc(g.workers,sizeof(pthread_t));
-    pthread_create(&cap_tid,NULL,capture_thread,NULL);
-    pthread_create(&ser_tid,NULL,serializer_thread,NULL);
-    for(uint32_t i=0;i<g.workers;++i)
-        pthread_create(&w_tid[i],NULL,worker_thread,(void*)(uintptr_t)i);
+    pthread_t *w_tids = calloc(g.workers, sizeof(pthread_t));
 
-    /* Ждём (но на самом деле никогда не вернётся) */
-    pthread_join(cap_tid,NULL);        /* никогда не возвращается          */
-    pthread_join(ser_tid,NULL);
-    for(uint32_t i=0;i<g.workers;++i) pthread_join(w_tid[i],NULL);
+    pthread_create(&cap_tid, NULL, capture_thread, NULL);
+    pthread_create(&ser_tid, NULL, serializer_thread, NULL);
+
+    for (uint32_t i = 0; i < g.workers; ++i) {
+        pthread_create(&w_tids[i], NULL, worker_thread, (void*)(uintptr_t)i);
+    }
+
+    // 7. Ждём потоков (на самом деле capture_thread бесконечен)
+    pthread_join(cap_tid, NULL);
+    pthread_join(ser_tid, NULL);
+    for (uint32_t i = 0; i < g.workers; ++i) {
+        pthread_join(w_tids[i], NULL);
+    }
+
     return 0;
 }

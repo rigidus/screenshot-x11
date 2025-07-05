@@ -43,4 +43,10 @@ viewer: src/viewer.c
 
 clean:
 	rm -f $(BIN) frame_*.png *_*.png
+	rm qimg_*
+	rm dbg_*
+
+dbg:
+	XCAP_DEBUG=1 XCAP_DEBUG_RAW=1 XCAP_DEBUG_QUANT=1 ./xcape_pipe --slots=1
+
 .PHONY: all clean
