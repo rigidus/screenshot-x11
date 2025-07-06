@@ -74,7 +74,7 @@ typedef struct {
     _Atomic enum slot_state st;
     uint64_t  t_start;
     uint8_t  *raw;     // указатель на сырое изображение RGB
-    uint8_t  *quant;   // RGB222 + старший transparency bit
+    uint8_t  *quant;   // RGB332 + старший transparency bit
     uint8_t  *color;   // массив цветов блоков uniform-цвет блока 8×8 или MIXED
 } FrameSlot;
 
@@ -226,7 +226,7 @@ static void init_x11(void)
 }
 
 
-/* ═════════════════════════ SIMD RGB888→RGB222 ═════════════════════════════ */
+/* ═════════════════════════ SIMD RGB888→RGB332 ═════════════════════════════ */
 
 #define BLOCK_SIZE    16
 #define MIXED         0xFF
@@ -568,140 +568,11 @@ static void dump_png_rgb(const char *fname, int W, int H, const uint8_t *rgb)
 }
 
 
+
 /**
- * dump_filled_blocks_png
- *
- * Рисует отладочное изображение, где каждый блок 8×8:
- * - если block_color == MIXED, внутри блока отображаются
- *   квантованные пиксели (RGB222 → RGB888);
- * - иначе блок заливается своим цветом, на нём:
- *     • левая и верхняя границы — белые,
- *     • правая и нижняя — чёрные,
- *     • диагональ ↘ (из TL в BR) — чёрная (алгоритм Брезенхема),
- *     • диагональ ↙ (из TR в BL) — белая.
+ * Находит все связанные «острова» блоков, у которых block_color==MIXED.
+ * Возвращает массив Island[ *out_n ], сам массив и поля need to be freed by caller.
  */
-
-
-static void dump_filled_blocks_png(const char *fname,
-                                   const uint8_t *quant,
-                                   const uint8_t *block_color)
-{
-    int W = g.w, H = g.h;
-    int pw = g.padded_w;
-    int bc = g.block_cols, br = g.block_rows;
-
-    // Буфер RGB888 для сохранения
-    uint8_t *rgb = malloc((size_t)W * H * 3);
-    if (!rgb) { perror("malloc"); return; }
-    // Фон — белый
-    memset(rgb, 255, (size_t)W * H * 3);
-
-    // Проход по блокам 8×8
-    for (int by = 0; by < br; ++by) {
-        for (int bx = 0; bx < bc; ++bx) {
-            int idx = by * bc + bx;
-            uint8_t c = block_color[idx];
-            int x0 = bx * BLOCK_SIZE;
-            int y0 = by * BLOCK_SIZE;
-            int w_blk = MIN(BLOCK_SIZE, W - x0);
-            int h_blk = MIN(BLOCK_SIZE, H - y0);
-
-            if (c == MIXED) {
-                // MIXED: рисуем квантованные пиксели
-                for (int dy = 0; dy < h_blk; ++dy) {
-                    for (int dx = 0; dx < w_blk; ++dx) {
-                        uint8_t q = quant[(y0 + dy) * pw + (x0 + dx)];
-                        uint8_t r2 = (q >> 4) & 3;
-                        uint8_t g2 = (q >> 2) & 3;
-                        uint8_t b2 =  q       & 3;
-                        uint8_t r8 = expand3(r2);
-                        uint8_t g8 = expand3(g2);
-                        uint8_t b8 = expand2(b2);
-                        size_t p = (size_t)(y0 + dy) * W + (x0 + dx);
-                        rgb[p*3 + 0] = r8;
-                        rgb[p*3 + 1] = g8;
-                        rgb[p*3 + 2] = b8;
-                    }
-                }
-            } else {
-                // UNIFORM: заливка блока своим цветом
-                uint8_t r2 = (c >> 4) & 3;
-                uint8_t g2 = (c >> 2) & 3;
-                uint8_t b2 =  c       & 3;
-                uint8_t r8 = expand3(r2);
-                uint8_t g8 = expand3(g2);
-                uint8_t b8 = expand2(b2);
-                // заполнить
-                for (int dy = 0; dy < h_blk; ++dy) {
-                    for (int dx = 0; dx < w_blk; ++dx) {
-                        size_t p = (size_t)(y0 + dy) * W + (x0 + dx);
-                        rgb[p*3 + 0] = r8;
-                        rgb[p*3 + 1] = g8;
-                        rgb[p*3 + 2] = b8;
-                    }
-                }
-                // рамки
-                // верхняя и левая — белые
-                for (int dx = 0; dx < w_blk; ++dx) {
-                    size_t p = (size_t)y0 * W + (x0 + dx);
-                    rgb[p*3+0] = rgb[p*3+1] = rgb[p*3+2] = 255;
-                }
-                for (int dy = 0; dy < h_blk; ++dy) {
-                    size_t p = (size_t)(y0 + dy) * W + x0;
-                    rgb[p*3+0] = rgb[p*3+1] = rgb[p*3+2] = 255;
-                }
-                // нижняя и правая — чёрные
-                for (int dx = 0; dx < w_blk; ++dx) {
-                    size_t p = (size_t)(y0 + h_blk - 1) * W + (x0 + dx);
-                    rgb[p*3+0] = rgb[p*3+1] = rgb[p*3+2] = 0;
-                }
-                for (int dy = 0; dy < h_blk; ++dy) {
-                    size_t p = (size_t)(y0 + dy) * W + (x0 + w_blk - 1);
-                    rgb[p*3+0] = rgb[p*3+1] = rgb[p*3+2] = 0;
-                }
-                // диагональ ↘ (чёрная) — Bresenham
-                {
-                    int dx = 0, dy = 0, err = 0;
-                    while (dx < w_blk && dy < h_blk) {
-                        size_t p = (size_t)(y0 + dy) * W + (x0 + dx);
-                        rgb[p*3+0] = rgb[p*3+1] = rgb[p*3+2] = 0;
-                        err += h_blk;
-                        if (err >= w_blk) {
-                            err -= w_blk;
-                            ++dy;
-                        }
-                        ++dx;
-                    }
-                }
-                // диагональ ↙ (из TR в BL, белая) — Bresenham
-                {
-                    int dx = 0, dy = 0, err = 0;
-                    while (dx < w_blk && dy < h_blk) {
-                        size_t p = (size_t)(y0 + dy) * W + (x0 + w_blk - 1 - dx);
-                        rgb[p*3+0] = rgb[p*3+1] = rgb[p*3+2] = 255;
-                        err += h_blk;
-                        if (err >= w_blk) {
-                            err -= w_blk;
-                            ++dy;
-                        }
-                        ++dx;
-                    }
-                }
-            }
-        }
-    }
-
-    // Сохраняем PNG
-    dump_png_rgb(fname, W, H, rgb);
-    free(rgb);
-}
-
-
-
-
-
-/// Находит все связанные «острова» блоков, у которых block_color==MIXED.
-/// Возвращает массив Island[ *out_n ], сам массив и поля need to be freed by caller.
 static Island* detect_mixed_islands(const uint8_t *block_color,
                                     int rows, int cols,
                                     int *out_n)
@@ -775,8 +646,8 @@ static Island* detect_mixed_islands(const uint8_t *block_color,
     return list;
 }
 
-
-/* signature: palette и counts выделяются внутри и возвращаются через указатели
+/**
+ * signature: palette и counts выделяются внутри и возвращаются через указатели
  * асимптотика O(BLOCK_SIZE² × number_of_blocks_in_island)
  */
 static void collect_palette_hist(
@@ -836,7 +707,9 @@ static void collect_palette_hist(
 
 
 
-/// Генерация «полупрозрачного» цвета из индекса
+/**
+ * Генерация «полупрозрачного» цвета из индекса
+ */
 static void pick_island_color(int idx, uint8_t *r, uint8_t *g, uint8_t *b) {
     // Простой хеш: меняем компоненты по-разному
     *r = (uint8_t)( 50 + (idx * 37) % 156 );
@@ -844,7 +717,9 @@ static void pick_island_color(int idx, uint8_t *r, uint8_t *g, uint8_t *b) {
     *b = (uint8_t)(150 + (idx * 83) %  76 );
 }
 
-/// Рисует огибающую рамку заданного острова (сплошной прямоугольник)
+/**
+ * Рисует огибающую рамку заданного острова (сплошной прямоугольник)
+ */
 static void draw_island_bbox(uint8_t *rgb, int W, int H,
                              const Island *isl, int padded_w,
                              uint8_t rr, uint8_t gg, uint8_t bb)
@@ -918,7 +793,9 @@ static void draw_island_bbox(uint8_t *rgb, int W, int H,
 }
 
 
-/// Debug: отрисовать острова поверх квантованного фона
+/**
+ *Debug: отрисовать острова поверх квантованного фона
+ */
 static void dump_islands_png(const char *fname,
                              const uint8_t *quant,
                              const Island *islands,
@@ -951,8 +828,8 @@ static void dump_islands_png(const char *fname,
 }
 
 
-// расширение RGB222 → [0..255]
-static inline void expand_rgb222(uint8_t q, uint8_t *r, uint8_t *g, uint8_t *b) {
+// расширение RGB332 → [0..255]
+static inline void expand_rgb332(uint8_t q, uint8_t *r, uint8_t *g, uint8_t *b) {
     *r = (q >> 4) & 0x3; *r = (*r<<6)|(*r<<4)|(*r<<2)|*r;
     *g = (q >> 2) & 0x3; *g = (*g<<6)|(*g<<4)|(*g<<2)|*g;
     *b = (q     ) & 0x3; *b = (*b<<6)|(*b<<4)|(*b<<2)|*b;
@@ -981,10 +858,10 @@ void compress_island_2col(const uint8_t *quant, int padded_w,
     double maxd = -1;
     int best1 = -1;
     uint8_t r0,g0,b0;
-    expand_rgb222(c0,&r0,&g0,&b0);
+    expand_rgb332(c0,&r0,&g0,&b0);
     for (int i = 0; i < pn; ++i) if (i != best0) {
             uint8_t ri,gi,bi;
-            expand_rgb222(pl[i], &ri, &gi, &bi);
+            expand_rgb332(pl[i], &ri, &gi, &bi);
             double d = (r0-ri)*(r0-ri) + (g0-gi)*(g0-gi) + (b0-bi)*(b0-bi);
             if (d > maxd) { maxd = d; best1 = i; }
         }
@@ -1002,10 +879,10 @@ void compress_island_2col(const uint8_t *quant, int padded_w,
         int q = pl[i];
         if (q == c0 || q == c1) continue;
         uint8_t ri,gi,bi;
-        expand_rgb222(q,&ri,&gi,&bi);
+        expand_rgb332(q,&ri,&gi,&bi);
         double d0 = (r0 - ri)*(r0 - ri) + (g0 - gi)*(g0 - gi) + (b0 - bi)*(b0 - bi);
         // раскладка для c1
-        uint8_t r1,g1,b1; expand_rgb222(c1,&r1,&g1,&b1);
+        uint8_t r1,g1,b1; expand_rgb332(c1,&r1,&g1,&b1);
         double d1 = (r1 - ri)*(r1 - ri) + (g1 - gi)*(g1 - gi) + (b1 - bi)*(b1 - bi);
         cluster[q] = (d1 < d0) ? 1 : 0;
     }
@@ -1064,7 +941,7 @@ void compress_island_2col_fast(
 
     // расширим c0 в RGB888 для вычисления дистанций
     uint8_t r0,g0,b0;
-    expand_rgb222(c0, &r0, &g0, &b0);
+    expand_rgb332(c0, &r0, &g0, &b0);
 
     // ищем в палитре цвет, максимально удалённый от c0
     double maxd = -1.0;
@@ -1072,7 +949,7 @@ void compress_island_2col_fast(
     for (int i = 0; i < palette_n; ++i) {
         if (i == best0) continue;
         uint8_t ri,gi,bi;
-        expand_rgb222(palette[i], &ri, &gi, &bi);
+        expand_rgb332(palette[i], &ri, &gi, &bi);
         double d = (r0 - ri)*(r0 - ri)
             + (g0 - gi)*(g0 - gi)
             + (b0 - bi)*(b0 - bi);
@@ -1097,8 +974,8 @@ void compress_island_2col_fast(
         if (q == c0 || q == c1) continue;
         // расстояния до c0 и c1
         uint8_t ri,gi,bi, r1,g1,b1;
-        expand_rgb222(q,   &ri,&gi,&bi);
-        expand_rgb222(c1, &r1,&g1,&b1);
+        expand_rgb332(q,   &ri,&gi,&bi);
+        expand_rgb332(c1, &r1,&g1,&b1);
         double d0 = (r0 - ri)*(r0 - ri) + (g0 - gi)*(g0 - gi) + (b0 - bi)*(b0 - bi);
         double d1 = (r1 - ri)*(r1 - ri) + (g1 - gi)*(g1 - gi) + (b1 - bi)*(b1 - bi);
         cluster[q] = (d1 < d0) ? 1 : 0;
@@ -1136,7 +1013,7 @@ void compress_island_2col_fast(
  *   - на выходе два цвета: фон и «всё остальное»,
  *   - битовая маска: 0=фон, 1=любой другой цвет.
  *
- * @param quant           входной буфер RGB222 [padded_h][padded_w]
+ * @param quant           входной буфер RGB332 [padded_h][padded_w]
  * @param padded_w        ширина quant с паддингом
  * @param isl             остров (список блоков)
  * @param palette         уже собранная palette[palette_n]
@@ -1213,7 +1090,7 @@ void compress_island_2col_simple(
  * @param fname     имя выходного PNG
  * @param isl       указатель на Island (список блоков)
  * @param padded_w  ширина квантованного буфера (с паддингом)
- * @param palette   два байта RGB222-кода: palette[0] и palette[1]
+ * @param palette   два байта RGB332-кода: palette[0] и palette[1]
  * @param mask      битовая маска длины = island.count*64 пикселей
  */
 void decompress_island_to_png(
@@ -1275,7 +1152,7 @@ void decompress_island_to_png(
                 // какой кластер: 0 или 1
                 int cluster = (mask[bitpos >> 3] >> (bitpos & 7)) & 1;
                 uint8_t q = palette[cluster];
-                // расширяем RGB222 → RGB888
+                // расширяем RGB332 → RGB888
                 uint8_t r2 = (q >> 5) & 7;
                 uint8_t g2 = (q >> 2) & 7;
                 uint8_t b2 =  q       & 3;
@@ -1363,6 +1240,186 @@ static void dump_all_islands_png(
 }
 
 
+#ifdef XCAP_DEBUG_RAW
+// Debug: dump raw BGRA→RGB buffer as PNG
+static void debug_dump_raw(int slot,
+                           const uint8_t *raw_bgra,
+                           int w, int h) {
+    uint8_t *rgb = malloc((size_t)w * h * 3);
+    if (!rgb) die("debug_dump_raw: malloc failed");
+    for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < w; ++x) {
+            size_t idx = (size_t)y * w + x;
+            const uint8_t *px = raw_bgra + idx * 4;
+            rgb[idx*3 + 0] = px[2]; // R
+            rgb[idx*3 + 1] = px[1]; // G
+            rgb[idx*3 + 2] = px[0]; // B
+        }
+    }
+    char fn[64];
+    struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
+    snprintf(fn, sizeof(fn), "dbg_raw_%d_%ld_%09ld.png",
+             slot, ts.tv_sec, ts.tv_nsec);
+    dump_png_rgb(fn, w, h, rgb);
+    free(rgb);
+}
+#endif
+
+
+#ifdef XCAP_DEBUG_QUANT
+// Debug: dump quantized RGB332 buffer as RGB888 PNG
+static void debug_dump_quant(int slot,
+                             const uint8_t *quant,
+                             int w, int h,
+                             int padded_w) {
+    uint8_t *rgb = malloc((size_t)w * h * 3);
+    if (!rgb) die("debug_dump_quant: malloc failed");
+    for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < w; ++x) {
+            uint8_t q  = quant[y * padded_w + x];
+            uint8_t r3 = (q >> 5) & 0x7;
+            uint8_t g3 = (q >> 2) & 0x7;
+            uint8_t b2 =  q        & 0x3;
+            size_t idx = (size_t)y * w + x;
+            rgb[idx*3+0] = expand3(r3);
+            rgb[idx*3+1] = expand3(g3);
+            rgb[idx*3+2] = expand2(b2);
+        }
+    }
+    char fn[64];
+    struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
+    snprintf(fn, sizeof(fn), "dbg_quant_%d_%ld_%09ld.png",
+             slot, ts.tv_sec, ts.tv_nsec);
+    dump_png_rgb(fn, w, h, rgb);
+    free(rgb);
+}
+#endif
+
+
+#ifdef XCAP_DEBUG_FILL
+static void dump_filled_blocks_png(const char *fname,
+                                   const uint8_t *quant,
+                                   const uint8_t *block_color)
+{
+    int W = g.w, H = g.h;
+    int pw = g.padded_w;
+    int bc = g.block_cols, br = g.block_rows;
+    const int BS = BLOCK_SIZE; // теперь 32
+
+    // Буфер RGB888 для сохранения
+    uint8_t *rgb = malloc((size_t)W * H * 3);
+    if (!rgb) { perror("dump_filled_blocks_png: malloc"); return; }
+    // Фон — белый
+    memset(rgb, 255, (size_t)W * H * 3);
+
+    // Проход по блокам BS×BS
+    for (int by = 0; by < br; ++by) {
+        for (int bx = 0; bx < bc; ++bx) {
+            int idx = by * bc + bx;
+            uint8_t c = block_color[idx];
+            int x0 = bx * BS;
+            int y0 = by * BS;
+            int w_blk = MIN(BS, W - x0);
+            int h_blk = MIN(BS, H - y0);
+
+            if (c == MIXED) {
+                // MIXED: рисуем квантованные пиксели
+                for (int dy = 0; dy < h_blk; ++dy) {
+                    for (int dx = 0; dx < w_blk; ++dx) {
+                        uint8_t q = quant[(y0 + dy) * pw + (x0 + dx)];
+                        uint8_t r3 = (q >> 5) & 0x7;
+                        uint8_t g3 = (q >> 2) & 0x7;
+                        uint8_t b2 =  q        & 0x3;
+                        uint8_t r8 = expand3(r3);
+                        uint8_t g8 = expand3(g3);
+                        uint8_t b8 = expand2(b2);
+                        size_t p = ((size_t)(y0 + dy) * W + (x0 + dx)) * 3;
+                        rgb[p + 0] = r8;
+                        rgb[p + 1] = g8;
+                        rgb[p + 2] = b8;
+                    }
+                }
+            } else {
+                // UNIFORM: заливка блоком своим цветом
+                uint8_t r3 = (c >> 5) & 0x7;
+                uint8_t g3 = (c >> 2) & 0x7;
+                uint8_t b2 =  c        & 0x3;
+                uint8_t r8 = expand3(r3);
+                uint8_t g8 = expand3(g3);
+                uint8_t b8 = expand2(b2);
+
+                // заливка
+                for (int dy = 0; dy < h_blk; ++dy) {
+                    for (int dx = 0; dx < w_blk; ++dx) {
+                        size_t p = ((size_t)(y0 + dy) * W + (x0 + dx)) * 3;
+                        rgb[p + 0] = r8;
+                        rgb[p + 1] = g8;
+                        rgb[p + 2] = b8;
+                    }
+                }
+                // рамки
+                // верхняя и левая — белые
+                for (int dx = 0; dx < w_blk; ++dx) {
+                    size_t p = (size_t)y0 * W + (x0 + dx);
+                    rgb[p*3+0] = rgb[p*3+1] = rgb[p*3+2] = 255;
+                }
+                for (int dy = 0; dy < h_blk; ++dy) {
+                    size_t p = (size_t)(y0 + dy) * W + x0;
+                    rgb[p*3+0] = rgb[p*3+1] = rgb[p*3+2] = 255;
+                }
+                // нижняя и правая — чёрные
+                for (int dx = 0; dx < w_blk; ++dx) {
+                    size_t p = (size_t)(y0 + h_blk - 1) * W + (x0 + dx);
+                    rgb[p*3+0] = rgb[p*3+1] = rgb[p*3+2] = 0;
+                }
+                for (int dy = 0; dy < h_blk; ++dy) {
+                    size_t p = (size_t)(y0 + dy) * W + (x0 + w_blk - 1);
+                    rgb[p*3+0] = rgb[p*3+1] = rgb[p*3+2] = 0;
+                }
+                // диагональ ↘ (чёрная) — Bresenham
+                {
+                    int dx = 0, dy = 0, err = 0;
+                    while (dx < w_blk && dy < h_blk) {
+                        size_t p = (size_t)(y0 + dy) * W + (x0 + dx);
+                        rgb[p*3+0] = rgb[p*3+1] = rgb[p*3+2] = 0;
+                        err += h_blk;
+                        if (err >= w_blk) { err -= w_blk; ++dy; }
+                        ++dx;
+                    }
+                }
+                // диагональ ↙ (белая) — Bresenham
+                {
+                    int dx = 0, dy = 0, err = 0;
+                    while (dx < w_blk && dy < h_blk) {
+                        size_t p = (size_t)(y0 + dy) * W + (x0 + w_blk - 1 - dx);
+                        rgb[p*3+0] = rgb[p*3+1] = rgb[p*3+2] = 255;
+                        err += h_blk;
+                        if (err >= w_blk) { err -= w_blk; ++dy; }
+                        ++dx;
+                    }
+                }
+            }
+        }
+    }
+
+    // Сохраняем PNG
+    dump_png_rgb(fname, W, H, rgb);
+    free(rgb);
+}
+
+
+// Debug: dump filled vs unfilled 32×32 blocks visualization
+static void debug_dump_filled(const uint8_t *quant,
+                              const uint8_t *block_color,
+                              int w, int h,
+                              int padded_w) {
+    char fn[64];
+    struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
+    snprintf(fn, sizeof(fn), "dbg_fill_%ld_%09ld.png",
+             ts.tv_sec, ts.tv_nsec);
+    dump_filled_blocks_png(fn, quant, block_color);
+}
+#endif
 
 
 
@@ -1391,85 +1448,30 @@ static void *worker_thread(void *arg)
             if (!atomic_compare_exchange_strong(&s->st, &exp, IN_PROGRESS))
                 continue;
 
+#ifdef XCAP_DEBUG_RAW
+            debug_dump_raw(i, s->raw, g.w, g.h);
+#endif
 
-            // === Отладочный вывод сырого скриншота перед обработкой
-            if (getenv("XCAP_DEBUG_RAW")) {
-                // Выделяем буфер RGB888 для сырого кадра
-                uint8_t *raw_rgb = malloc((size_t)g.w * g.h * 3);
-                if (raw_rgb) {
-                    // Конвертация BGRA→RGB
-                    for (int y = 0; y < g.h; ++y) {
-                        for (int x = 0; x < g.w; ++x) {
-                            size_t idx = (size_t)y * g.w + x;
-                            uint8_t *px = s->raw + idx * 4;
-                            raw_rgb[idx*3 + 0] = px[2]; // R
-                            raw_rgb[idx*3 + 1] = px[1]; // G
-                            raw_rgb[idx*3 + 2] = px[0]; // B
-                        }
-                    }
-                    char raw_fn[64];
-                    struct timespec t2; clock_gettime(CLOCK_REALTIME, &t2);
-                    snprintf(raw_fn, sizeof(raw_fn), "dbg_raw_%u_%ld_%09ld.png",
-                             i, t2.tv_sec, t2.tv_nsec);
-                    dump_png_rgb(raw_fn, g.w, g.h, raw_rgb);
-                    // Освобождаем буфер RGB88
-                    free(raw_rgb);
-                }
-            }
-
-
-            // === Квантование RGB222 + анализ uniform-блоков 8×8
+            // === Квантование RGB332 + анализ uniform-блоков 32×32
             // Принимает: s->raw - ARGB8888
             // Возвращает:
-            //    s->quant,    // RGB222-byte per px
+            //    s->quant,    // RGB332-byte per px
             //    s->color,    // блоки 8×8: uniform-цвет или MIXED (0xFF)
             // Ничего не выделяет, что следовало бы освободить.
             quantize_and_analyze(
                 s->raw,      // ARGB8888
-                s->quant,    // RGB222-byte per px
+                s->quant,    // RGB332-byte per px
                 s->color,    // блоки 8×8: uniform-цвет или MIXED (0xFF)
                 g.w, g.h);
 
+#ifdef XCAP_DEBUG_QUANT
+            debug_dump_quant(i, s->quant, g.w, g.h, g.padded_w);
+#endif
 
-            // === Отладочный вывод квантованного изображения RGB222
-            if (getenv("XCAP_DEBUG_QUANT")) {
-                // Выделяем RGB888 буфер
-                uint8_t *rgb = malloc((size_t)g.w * g.h * 3);
-                if (!rgb) { die("XCAP_DEBUG_QUANT malloc failed"); }
-                // Конвертация
-                for (int y = 0; y < g.h; ++y) {
-                    for (int x = 0; x < g.w; ++x) {
-                        uint8_t q = s->quant[y * g.padded_w + x];
-                        uint8_t r2 = (q>>4)&0x3;
-                        uint8_t g2 = (q>>2)&0x3;
-                        uint8_t b2 =  q    &0x3;
-                        size_t idx = (size_t)y * g.w + x;
-                        rgb[idx*3+0] = EXPAND2(r2);
-                        rgb[idx*3+1] = EXPAND2(g2);
-                        rgb[idx*3+2] = EXPAND2(b2);
-                    }
-                }
-                // Сохраняем PNG
-                char qfn[64];
-                struct timespec t0;
-                clock_gettime(CLOCK_REALTIME, &t0);
-                snprintf(qfn, sizeof(qfn),
-                         "dbg_quant_%u_%ld_%09ld.png",
-                         i, t0.tv_sec, t0.tv_nsec);
-                dump_png_rgb(qfn, g.w, g.h, rgb);
-                free(rgb);
-            }
 
-            // === Отладочный вывод с отображением залитых и незалитых блоков 8×8
-            if (getenv("XCAP_DEBUG_FILL")) {
-                char ffn[64];
-                struct timespec t1;
-                clock_gettime(CLOCK_REALTIME, &t1);
-                snprintf(ffn, sizeof(ffn),
-                         "dbg_fill_%u_%ld_%09ld.png",
-                         i, t1.tv_sec, t1.tv_nsec);
-                dump_filled_blocks_png(ffn, s->quant, s->color);
-            }
+#ifdef XCAP_DEBUG_FILL
+            debug_dump_filled(s->quant, s->color, g.w, g.h, g.padded_w);
+#endif
 
             // === Найти "острова" MIXED-блоков
             // Принимает: s->color - блоки 8×8: uniform-цвет или MIXED (0xFF)
@@ -1492,7 +1494,7 @@ static void *worker_thread(void *arg)
                 int     *counts;    // cnt[i] — частота цвета palette[i].
                 // Собираем палитру и гистограмму частот
                 // Принимает:
-                //    s->quant - RGB222-byte per px
+                //    s->quant - RGB332-byte per px
                 //    isl - остров
                 // Возвращает:
                 //    *palette   - палитру, динамически выделенный массив байт,
@@ -1502,7 +1504,7 @@ static void *worker_thread(void *arg)
                 //    *palette
                 //    *counts
                 collect_palette_hist(
-                    s->quant,       // RGB222-byte per px
+                    s->quant,       // RGB332-byte per px
                     g.padded_w,
                     isl,
                     &palette,

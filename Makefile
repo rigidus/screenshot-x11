@@ -1,4 +1,4 @@
-CC     := gcc
+CC     := gcc -DXCAP_DEBUG_QUANT -DXCAP_DEBUG_RAW -DXCAP_DEBUG_FILL
 CFLAGS := -O3 -std=c11 -Wall -Wextra -pedantic
 LIBPNG := -lpng
 XLIBS  := -lX11 -lXext          # нужны только для capture, можно оставить
