@@ -47,6 +47,10 @@
 
 
 /* ---------- константы и вспомогалки ------------------------------------ */
+#ifndef MIN
+#define MIN(a,b) ((a) < (b) ? (a) : (b))
+#endif
+
 #define DEFAULT_SLOTS 4
 #define MAX_SLOTS     8
 #define COLOR_MIXED   0xFFFF
@@ -69,9 +73,9 @@ enum slot_state { FREE, RAW_READY, IN_PROGRESS, QUANT_DONE, SERIALIZING };
 typedef struct {
     _Atomic enum slot_state st;
     uint64_t  t_start;
-    uint8_t  *raw;
+    uint8_t  *raw;     // указатель на сырое изображение RGB
     uint8_t  *quant;   // RGB222 + старший transparency bit
-    uint8_t  *color;   // uniform-цвет блока 8×8 или MIXED
+    uint8_t  *color;   // массив цветов блоков uniform-цвет блока 8×8 или MIXED
 } FrameSlot;
 
 /* максимальное количество слотов задаётся константой MAX_SLOTS */
@@ -122,10 +126,6 @@ static void init_x11(void);
 static void *capture_thread(void*);
 static void dump_png_rgb(const char *fname, int W, int H, const uint8_t *rgb);
 static void dump_islands_png(const char *fname, const uint8_t *quant, const Island *islands, int island_n);
-void compress_island_2col(const uint8_t *quant, int padded_w,
-                          const Island *isl,
-                          uint8_t palette[2],
-                          uint8_t **mask, int *out_mask_bytes);
 void decompress_island_to_png(const char *fname,
                               const Island *isl,
                               int padded_w,
@@ -230,7 +230,7 @@ static void init_x11(void)
 
 #define BLOCK_SIZE    8
 #define MIXED         0xFF
-#define TRANSP_BIT    0x80
+#define TRANSP_BIT    0x80  // binary:1000.0000
 
 
 // Проверка поддержки AVX2 (разовая, в init)
@@ -256,11 +256,11 @@ static inline uint8_t expand2(uint8_t v) {
 }
 
 static void quantize_and_analyze(
-    const uint8_t *src0,     // ARGB8888, stride = w*4
-    uint8_t       *quant,    // буфер [padded_w * padded_h]
-    uint8_t       *block_color, // буфер [block_count]
-    int             w,
-    int             h
+    const uint8_t *src0,         // ARGB8888, stride = w*4
+    uint8_t       *quant,        // буфер [padded_w * padded_h]
+    uint8_t       *block_color,  // буфер [block_count]
+    int            w,
+    int            h
     ) {
     int pw = g.padded_w;
     int ph = g.padded_h;
@@ -274,7 +274,7 @@ static void quantize_and_analyze(
 
     // Обход по строкам: отдельно для src (ширина w) и quant (ширина pw)
     for (int y = 0; y < ph; ++y) {
-        const uint8_t *row_src = src0 + (size_t)y * w * 4;
+        const uint8_t *row_src = src0  + (size_t)y * w * 4;
         uint8_t       *row_q   = quant + (size_t)y * pw;
         int x = 0;
 
@@ -536,33 +536,6 @@ static void dump_png_rgb(const char *fname, int W, int H, const uint8_t *rgb)
 }
 
 
-void dump_quantized_rgb222_png(const char *fname,
-                               const uint8_t *quant,
-                               int W, int H,
-                               int padded_w, int padded_h) {
-    padded_h = (int)padded_h;
-    // Выделяем RGB888 буфер
-    uint8_t *rgb = malloc((size_t)W * H * 3);
-    if (!rgb) { perror("malloc"); return; }
-    // Конвертация
-    for (int y = 0; y < H; ++y) {
-        for (int x = 0; x < W; ++x) {
-            uint8_t q = quant[y * padded_w + x];
-            uint8_t r2 = (q>>4)&0x3;
-            uint8_t g2 = (q>>2)&0x3;
-            uint8_t b2 =  q    &0x3;
-            size_t idx = (size_t)y * W + x;
-            rgb[idx*3+0] = EXPAND2(r2);
-            rgb[idx*3+1] = EXPAND2(g2);
-            rgb[idx*3+2] = EXPAND2(b2);
-        }
-    }
-    // Сохраняем PNG
-    dump_png_rgb(fname, W, H, rgb);
-    free(rgb);
-}
-
-
 /**
  * dump_filled_blocks_png
  *
@@ -576,9 +549,6 @@ void dump_quantized_rgb222_png(const char *fname,
  *     • диагональ ↙ (из TR в BL) — белая.
  */
 
-#ifndef MIN
-#define MIN(a,b) ((a) < (b) ? (a) : (b))
-#endif
 
 static void dump_filled_blocks_png(const char *fname,
                                    const uint8_t *quant,
@@ -588,7 +558,7 @@ static void dump_filled_blocks_png(const char *fname,
     int pw = g.padded_w;
     int bc = g.block_cols, br = g.block_rows;
 
-    // Буфер RGB888
+    // Буфер RGB888 для сохранения
     uint8_t *rgb = malloc((size_t)W * H * 3);
     if (!rgb) { perror("malloc"); return; }
     // Фон — белый
@@ -704,15 +674,21 @@ static Island* detect_mixed_islands(const uint8_t *block_color,
                                     int rows, int cols,
                                     int *out_n)
 {
+    // Вычисляется общее число блоков N = rows * cols.
     int N = rows * cols;
+    // Создаётся массив vis[N] (булев), чтобы помечать, какие блоки уже посещены.
     bool *vis = calloc(N, sizeof(bool));
+    // Заводится динамический массив list для хранения найденных островов (Island),
     Island *list = NULL;
+    // а также счётчики list_n (сколько уже добавлено) и list_cap (ёмкость).
     int  list_n = 0, list_cap = 0;
 
     // Вспомогательная очередь для BFS
     int *queue = malloc(N * sizeof(int));
 
+    // Основной цикл по всем блокам
     for (int idx = 0; idx < N; ++idx) {
+        // Мы ищем каждый блок, у которого цвет MIXED и который ещё не был посещён.
         if (vis[idx] || block_color[idx] != MIXED) continue;
 
         // начинаем новый остров
@@ -724,8 +700,9 @@ static Island* detect_mixed_islands(const uint8_t *block_color,
         isl->count = 0;
         isl->cap   = 0;
         isl->blocks = NULL;
+        // Это будет наш очередной остров — набор смежных «смешанных» блоков.
 
-        // BFS из idx
+        // BFS из idx (BFS (поиск в ширину) из стартового блока)
         int qh=0, qt=0;
         queue[qt++] = idx;
         vis[idx] = true;
@@ -753,6 +730,11 @@ static Island* detect_mixed_islands(const uint8_t *block_color,
                 }
             }
         }
+        // После того, как BFS закончился, мы полностью собрали один
+        // остров: все «смешанные» блоки, до которых можно добраться
+        // из стартового, помечены и добавлены. Цикл for(idx…)
+        // продолжит искать следующие непосещённые «смешанные» блоки
+        // и так до конца.
     }
 
     free(vis);
@@ -796,7 +778,9 @@ static uint8_t* collect_palette(const uint8_t *quant,
 }
 
 
-// signature: palette и counts выделяются внутри и возвращаются через указатели
+/* signature: palette и counts выделяются внутри и возвращаются через указатели
+ * асимптотика O(BLOCK_SIZE² × number_of_blocks_in_island)
+ */
 static void collect_palette_hist(
     const uint8_t *quant,
     int padded_w,
@@ -805,29 +789,48 @@ static void collect_palette_hist(
     int    *out_palette_n,
     int   **out_counts
     ) {
-    bool seen[256]={0};
-    int *counts = calloc(256, sizeof(int));  // по цветовому индексу
-    uint8_t *palette = malloc(256);
-    int pcount = 0;
 
+    // отслеживаем, какие цвета уже добавлены в палитру
+    // seen[q] = true означает, что цвет q уже записан в palette.
+    bool seen[256]={0};
+    // counts[q] будет считать количество пикселей цвета q.
+    int *counts = calloc(256, sizeof(int));
+    uint8_t *palette = malloc(256);         // максимум 256 возможных значений
+    int pcount = 0;                         // сколько цветов в палитре
+
+    // Перебор блоков внутри острова
     for (int bi = 0; bi < isl->count; ++bi) {
+        // Каждый элемент isl->blocks[bi] — это номер 8×8-блока внутри
+        // исходного изображения.  Из него вычисляют координаты
+        // верхнего-левого угла блока (y0, x0).
         int b = isl->blocks[bi];
         int br = b / g.block_cols, bc = b % g.block_cols;
         int y0 = br*BLOCK_SIZE, x0 = bc*BLOCK_SIZE;
+        // Перебор всех пикселей в блоке
         for (int dy=0; dy<BLOCK_SIZE; ++dy) {
             for (int dx=0; dx<BLOCK_SIZE; ++dx) {
+                // Берём каждый квантованный байт q из буфера quant
+                // (ширина с учётом выравнивания — padded_w).
                 uint8_t q = quant[(y0+dy)*padded_w + (x0+dx)];
-                if (q & TRANSP_BIT) continue;
+                if (q & TRANSP_BIT) continue; // пропускаем «прозрачные» пиксели
                 if (!seen[q]) {
+                    // первый раз, когда цвет q встречается,
+                    // добавляем его в массив palette и отмечаем в seen.
                     seen[q] = true;
                     palette[pcount++] = q;
                 }
+                // каждый раз, когда попадается пиксель цвета q,
+                // инкрементируем counts[q]
                 counts[q] += 1;
             }
         }
     }
+    // указатель на динамически выделенный массив из pcount байт,
+    // каждый — это уникальный цвет.
     *out_palette   = palette;
-    *out_palette_n = pcount;
+    *out_palette_n = pcount; // число этих уникальных цветов.
+    // указатель на массив из 256 int, где counts[q] - сколько всего
+    // пикселей цвета q в острове
     *out_counts    = counts;
 }
 
@@ -1025,6 +1028,95 @@ void compress_island_2col(const uint8_t *quant, int padded_w,
     free(counts);
 }
 
+void compress_island_2col_fast(
+    const uint8_t   *quant,
+    int              padded_w,
+    const Island    *isl,
+    const uint8_t   *palette,
+    int              palette_n,
+    const int       *counts,
+    uint8_t          out_pal2[2],
+    uint8_t        **out_mask,
+    int             *out_mask_bytes
+    ) {
+    // 1) выбрать два опорных цвета: наиболее частый (c0) и максимально удалённый от него (c1)
+    // -------------------------------------------------------
+    // находим индекс самого частого
+    int best0 = 0;
+    for (int i = 1; i < palette_n; ++i) {
+        if (counts[ palette[i] ] > counts[ palette[best0] ])
+            best0 = i;
+    }
+    uint8_t c0 = palette[best0];
+
+    // расширим c0 в RGB888 для вычисления дистанций
+    uint8_t r0,g0,b0;
+    expand_rgb222(c0, &r0, &g0, &b0);
+
+    // ищем в палитре цвет, максимально удалённый от c0
+    double maxd = -1.0;
+    int best1 = -1;
+    for (int i = 0; i < palette_n; ++i) {
+        if (i == best0) continue;
+        uint8_t ri,gi,bi;
+        expand_rgb222(palette[i], &ri, &gi, &bi);
+        double d = (r0 - ri)*(r0 - ri)
+            + (g0 - gi)*(g0 - gi)
+            + (b0 - bi)*(b0 - bi);
+        if (d > maxd) {
+            maxd = d;
+            best1 = i;
+        }
+    }
+    uint8_t c1 = (best1 >= 0 ? palette[best1] : (c0 ^ 0x3F));
+
+    out_pal2[0] = c0;
+    out_pal2[1] = c1;
+
+    // 2) построить кластеризацию: для каждого q из палитры определить, к какому кластеру (0 или 1) он ближе
+    // -------------------------------------------------------------------------------------------------
+    uint8_t cluster[256] = {0};
+    cluster[c0] = 0;
+    cluster[c1] = 1;
+
+    for (int i = 0; i < palette_n; ++i) {
+        uint8_t q = palette[i];
+        if (q == c0 || q == c1) continue;
+        // расстояния до c0 и c1
+        uint8_t ri,gi,bi, r1,g1,b1;
+        expand_rgb222(q,   &ri,&gi,&bi);
+        expand_rgb222(c1, &r1,&g1,&b1);
+        double d0 = (r0 - ri)*(r0 - ri) + (g0 - gi)*(g0 - gi) + (b0 - bi)*(b0 - bi);
+        double d1 = (r1 - ri)*(r1 - ri) + (g1 - gi)*(g1 - gi) + (b1 - bi)*(b1 - bi);
+        cluster[q] = (d1 < d0) ? 1 : 0;
+    }
+
+    // 3) сформировать битовую маску: для каждого пикселя острова пишем 0/1
+    // -----------------------------------------------------------------
+    int pixels = isl->count * BLOCK_SIZE * BLOCK_SIZE;
+    int bytes  = (pixels + 7) / 8;
+    uint8_t *m = calloc(bytes, 1);
+    int bitpos = 0;
+
+    for (int bi = 0; bi < isl->count; ++bi) {
+        int b = isl->blocks[bi];
+        int by = b / g.block_cols, bx = b % g.block_cols;
+        int y0 = by * BLOCK_SIZE, x0 = bx * BLOCK_SIZE;
+
+        for (int dy = 0; dy < BLOCK_SIZE; ++dy) {
+            for (int dx = 0; dx < BLOCK_SIZE; ++dx, ++bitpos) {
+                int idx = (y0 + dy) * padded_w + (x0 + dx);
+                uint8_t q = quant[idx];
+                if (cluster[q])
+                    m[bitpos >> 3] |= (1 << (bitpos & 7));
+            }
+        }
+    }
+
+    *out_mask        = m;
+    *out_mask_bytes  = bytes;
+}
+
 
 /**
  * decompress_island_to_png
@@ -1187,6 +1279,20 @@ static void dump_all_islands_png(
 
 
 
+
+
+static uint8_t * _sort_palette;
+static int     * _sort_counts;
+static int cmp_order_desc(const void *pa, const void *pb) {
+    int ia = *(const int*)pa;
+    int ib = *(const int*)pb;
+    // сравниваем по убыванию counts[ palette[idx] ]
+    return _sort_counts[_sort_palette[ib]]
+        - _sort_counts[_sort_palette[ia]];
+}
+
+
+
 static void *worker_thread(void *arg)
 {
     /* uintptr_t wid = (uintptr_t)arg; */
@@ -1200,7 +1306,8 @@ static void *worker_thread(void *arg)
             if (!atomic_compare_exchange_strong(&s->st, &exp, IN_PROGRESS))
                 continue;
 
-            // Отладочный вывод сырого скриншота перед обработкой
+
+            // === Отладочный вывод сырого скриншота перед обработкой
             if (getenv("XCAP_DEBUG_RAW")) {
                 // Выделяем буфер RGB888 для сырого кадра
                 uint8_t *raw_rgb = malloc((size_t)g.w * g.h * 3);
@@ -1220,36 +1327,55 @@ static void *worker_thread(void *arg)
                     snprintf(raw_fn, sizeof(raw_fn), "dbg_raw_%u_%ld_%09ld.png",
                              i, t2.tv_sec, t2.tv_nsec);
                     dump_png_rgb(raw_fn, g.w, g.h, raw_rgb);
+                    // Освобождаем буфер RGB88
                     free(raw_rgb);
                 }
             }
 
-            // 1) Квантование RGB222 + анализ uniform-блоков 8×8
+
+            // === Квантование RGB222 + анализ uniform-блоков 8×8
+            // Принимает: s->raw - ARGB8888
+            // Возвращает:
+            //    s->quant,    // RGB222-byte per px
+            //    s->color,    // блоки 8×8: uniform-цвет или MIXED (0xFF)
+            // Ничего не выделяет, что следовало бы освободить.
             quantize_and_analyze(
                 s->raw,      // ARGB8888
                 s->quant,    // RGB222-byte per px
-                s->color,     // блоки 8×8: uniform-цвет или MIXED (0xFF)
-                g.w,
-                g.h);
+                s->color,    // блоки 8×8: uniform-цвет или MIXED (0xFF)
+                g.w, g.h);
 
 
-            // 1a) Отладочный вывод чистого квантованного изображения RGB222
+            // === Отладочный вывод квантованного изображения RGB222
             if (getenv("XCAP_DEBUG_QUANT")) {
+                // Выделяем RGB888 буфер
+                uint8_t *rgb = malloc((size_t)g.w * g.h * 3);
+                if (!rgb) { die("XCAP_DEBUG_QUANT malloc failed"); }
+                // Конвертация
+                for (int y = 0; y < g.h; ++y) {
+                    for (int x = 0; x < g.w; ++x) {
+                        uint8_t q = s->quant[y * g.padded_w + x];
+                        uint8_t r2 = (q>>4)&0x3;
+                        uint8_t g2 = (q>>2)&0x3;
+                        uint8_t b2 =  q    &0x3;
+                        size_t idx = (size_t)y * g.w + x;
+                        rgb[idx*3+0] = EXPAND2(r2);
+                        rgb[idx*3+1] = EXPAND2(g2);
+                        rgb[idx*3+2] = EXPAND2(b2);
+                    }
+                }
+                // Сохраняем PNG
                 char qfn[64];
                 struct timespec t0;
                 clock_gettime(CLOCK_REALTIME, &t0);
                 snprintf(qfn, sizeof(qfn),
                          "dbg_quant_%u_%ld_%09ld.png",
                          i, t0.tv_sec, t0.tv_nsec);
-                dump_quantized_rgb222_png(
-                    qfn,
-                    s->quant,
-                    g.w, g.h,
-                    g.padded_w, g.padded_h
-                    );
+                dump_png_rgb(qfn, g.w, g.h, rgb);
+                free(rgb);
             }
 
-            /* 1c) Отладочный дамп: залитые блоки 8×8 */
+            // === Отладочный вывод с отображением залитых и незалитых блоков 8×8
             if (getenv("XCAP_DEBUG_FILL")) {
                 char ffn[64];
                 struct timespec t1;
@@ -1260,194 +1386,200 @@ static void *worker_thread(void *arg)
                 dump_filled_blocks_png(ffn, s->quant, s->color);
             }
 
+            // === Найти "острова" MIXED-блоков
+            // Принимает: s->color - блоки 8×8: uniform-цвет или MIXED (0xFF)
+            // Возвращает:
+            //    *islands,    // Массив "островов"
+            //    island_n,    // Количество найденных "островов"
+            // Выделяет:
+            //    *islands
+            int island_n;
+            Island *islands = detect_mixed_islands(
+                s->color, g.block_rows, g.block_cols, &island_n);
 
-            // 1d) Отладка: найти «острова» MIXED-блоков и собрать для них палитру
-            if (getenv("XCAP_DEBUG_ISLANDS")) {
-                int island_n;
-                Island *islands = detect_mixed_islands(
-                    s->color,
-                    g.block_rows, g.block_cols,
-                    &island_n
+            // === собрать для "островов" MIXED-блоков палитру
+
+            // 1) Печатаем палитры для каждого острова
+            for (int isl_i = 0; isl_i < island_n; ++isl_i) {
+                Island *isl = &islands[isl_i];
+                uint8_t *palette;   // содержат 8-битные цвета
+                int      palette_n; // длина массива palette
+                int     *counts;    // cnt[i] — частота цвета palette[i].
+                // Собираем палитру и гистограмму частот
+                // Принимает:
+                //    s->quant - RGB222-byte per px
+                //    isl - остров
+                // Возвращает:
+                //    *palette   - палитру, динамически выделенный массив байт,
+                //                 каждый — это уникальный цвет.
+                //    *palette_n - количество элементов палитры
+                // Выделяет:
+                //    *palette
+                //    *counts
+                collect_palette_hist(
+                    s->quant,       // RGB222-byte per px
+                    g.padded_w,
+                    isl,
+                    &palette,
+                    &palette_n,
+                    &counts
                     );
-                // 1) Печатаем палитры для каждого острова (не освобождаем ещё blocks)
-                for (int isl_i = 0; isl_i < island_n; ++isl_i) {
-                    Island *isl = &islands[isl_i];
-                    int palette_n;
-                    uint8_t *palette = collect_palette(
-                        s->quant,
+
+                // Выводим размер и содержимое палитры
+                fprintf(stdout,
+                        "[slot %u] island %d: blocks=%d palette=%d:",
+                        i, isl_i, (&islands[isl_i])->count, palette_n);
+                for (int pi = 0; pi < palette_n; ++pi) {
+                    fprintf(stdout, " %02X", palette[pi]);
+                }
+                fprintf(stdout, "\n");
+
+                /* [TODO:] Здесь нужно сливать острова если один находится внутри другого */
+
+                /* CLASSIFY */
+
+                /* Сортируем индексы цвета palette по убыванию cnt. */
+                int order[64]; // массив индексов order, ссылаеющихся на элементы палитры
+                if (palette_n > 0 && palette_n <= 64) {
+                    /* заполняем массив order */
+                    for (int k = 0; k < palette_n; ++k) order[k] = k;
+                    // По окончании сортировки
+                    // order[0] указывает на наиболее частый цвет,
+                    // order [1] — на второй по частоте и так далее
+                    _sort_palette = palette;
+                    _sort_counts  = counts;
+                    qsort(order, palette_n, sizeof *order, cmp_order_desc);
+                }
+
+                // Считаем сколько всего пикселей в острове
+                int total = 0;
+                for (int pi = 0; pi < palette_n; ++pi) {
+                    total += counts[ palette[pi] ];
+                }
+                // Цвет фона - это самый частый цвет
+                int bgc = counts[ palette[ order[0] ] ];
+                // Цвет текста - скорее всего второй по частоте
+                int txc = (palette_n > 1 ? counts[ palette[ order[1] ] ] : 0);
+                /* Доля фонового цвета cnt[0]/total_pixels (должна быть большая) */
+                float bg_frac = (float)bgc / total;
+                /* Доля текста cnt[1]/total_pixels (должна быть ненулевая) */
+                float fg_frac = (float)txc / total;
+
+                // Вычисляем минимальный ограничивающий прямоугольник («bounding box»)
+                // данного острова в пиксельных координатах
+                int minx = g.w, miny = g.h, maxx = 0, maxy = 0;
+                for (int j = 0; j < islands[isl_i].count; ++j) {
+                    int b = islands[isl_i].blocks[j];
+                    int by = b / g.block_cols;
+                    int bx = b % g.block_cols;
+                    int x0 = bx * BLOCK_SIZE;
+                    int y0 = by * BLOCK_SIZE;
+                    if (x0 < minx) minx = x0;
+                    if (y0 < miny) miny = y0;
+                    if (x0 + BLOCK_SIZE - 1 > maxx) maxx = x0 + BLOCK_SIZE - 1;
+                    if (y0 + BLOCK_SIZE - 1 > maxy) maxy = y0 + BLOCK_SIZE - 1;
+                }
+                // Вычисляем отношение сторон
+                float shape_ratio = (float)(maxx - minx + 1) / (maxy - miny + 1);
+                // Вычисляем похожесть острова на текст
+                bool is_text = (palette_n <= 16)
+                    && (bg_frac >= 0.6f)
+                    && (fg_frac >= 0.03f)
+                    /* && (shape_ratio >= 4.0f) */
+                    ;
+
+                fprintf(
+                    stdout,
+                    "[slot %u][island %d] palette=%d total_px=%d bg=%.2f fg=%.2f shape=%.1f => %s\n",
+                    i, isl_i, palette_n, total, bg_frac, fg_frac, shape_ratio,
+                    is_text ? "TEXT" : "GRAPHIC");
+
+                /* END_CLASSIFY */
+
+                // 1e) Отладка: сжать каждый остров 2-цветной палитрой
+                uint8_t pal2[2], *mask2;
+                int mask_bytes2;
+                compress_island_2col_fast(
+                    s->quant, g.padded_w,
+                    &islands[isl_i],
+                    palette, palette_n,
+                    counts,
+                    pal2, &mask2, &mask_bytes2
+                    );
+                fprintf(
+                    stdout,
+                    "[slot %u][island %d] compressed → palette=(%02X,%02X) mask_bytes=%d\n",
+                    i, isl_i, pal2[0], pal2[1], mask_bytes2
+                    );
+
+                // 1f) Отладочный дамп: распаковать и сохранить остров
+                if (getenv("XCAP_DEBUG_DECOMPRESS")) {
+                    char dfn[64];
+                    struct timespec dt;
+                    clock_gettime(CLOCK_REALTIME, &dt);
+                    snprintf(dfn, sizeof(dfn),
+                             "dbg_decomp_%u_%d_%ld.png",
+                             i, isl_i, dt.tv_sec);
+                    decompress_island_to_png(
+                        dfn,
+                        &islands[isl_i],
                         g.padded_w,
-                        isl,
-                        &palette_n
-                        );
-                    // Выводим размер и содержимое палитры
-                    fprintf(stdout,
-                            "[slot %u] island %d: blocks=%d palette=%d:",
-                            i, isl_i, isl->count, palette_n
-                        );
-                    for (int pi = 0; pi < palette_n; ++pi) {
-                        fprintf(stdout, " %02X", palette[pi]);
-                    }
-                    fprintf(stdout, "\n");
-                    free(palette);
-                    /* free(isl->blocks); */
-
-                    /* CLASSIFY */
-                    if (getenv("XCAP_DEBUG_CLASSIFY")) {
-                        uint8_t *palette;
-                        int      palette_n;
-                        int     *counts;
-                        /* Пусть cnt[i] — частота цвета palette[i]. */
-                        collect_palette_hist(s->quant, g.padded_w, &islands[isl_i],
-                                             &palette, &palette_n, &counts);
-
-                        int total = 0;
-                        for (int pi = 0; pi < palette_n; ++pi)
-                            total += counts[ palette[pi] ];
-
-                        /* Сортируем индексы цвета palette по убыванию cnt. */
-                        int order[16];
-                        for (int k = 0; k < palette_n; ++k) order[k] = k;
-                        for (int a = 0; a < palette_n; ++a) {
-                            for (int b = a+1; b < palette_n; ++b) {
-                                if (counts[ palette[ order[b] ] ] > counts[ palette[ order[a] ] ]) {
-                                    int tmp = order[a]; order[a] = order[b]; order[b] = tmp;
-                                }
-                            }
-                        }
-
-                        // Цвет фона
-                        int bgc = counts[ palette[ order[0] ] ];
-                        // Цвет текста
-                        int txc = (palette_n > 1 ? counts[ palette[ order[1] ] ] : 0);
-                        /* Доля фонового цвета cnt[0]/total_pixels (должна быть большая) */
-                        float bg_frac = (float)bgc / total;
-                        /* Доля текста cnt[1]/total_pixels (должна быть ненулевая) */
-                        float fg_frac = (float)txc / total;
-
-                        // Вычисляем форму острова
-                        int minx = g.w, miny = g.h, maxx = 0, maxy = 0;
-                        for (int j = 0; j < islands[isl_i].count; ++j) {
-                            int b = islands[isl_i].blocks[j];
-                            int by = b / g.block_cols;
-                            int bx = b % g.block_cols;
-                            int x0 = bx * BLOCK_SIZE;
-                            int y0 = by * BLOCK_SIZE;
-                            if (x0 < minx) minx = x0;
-                            if (y0 < miny) miny = y0;
-                            if (x0 + BLOCK_SIZE - 1 > maxx) maxx = x0 + BLOCK_SIZE - 1;
-                            if (y0 + BLOCK_SIZE - 1 > maxy) maxy = y0 + BLOCK_SIZE - 1;
-                        }
-                        float shape_ratio = (float)(maxx - minx + 1) / (maxy - miny + 1);
-
-                        bool is_text = (palette_n <= 16)
-                            && (bg_frac >= 0.6f)
-                            && (fg_frac >= 0.03f)
-                            /* && (shape_ratio >= 4.0f) */
-                            ;
-
-                        fprintf(
-                            stdout,
-                            "[slot %u][island %d] palette=%d total_px=%d bg=%.2f fg=%.2f shape=%.1f => %s\n",
-                            i, isl_i, palette_n, total, bg_frac, fg_frac, shape_ratio,
-                            is_text ? "TEXT" : "GRAPHIC");
-
-                        free(palette);
-                        free(counts);
-                    }
-                    /* END_CLASSIFY */
-
-                    // 1e) Отладка: сжать каждый остров 2-цветной палитрой
-                    if (getenv("XCAP_DEBUG_COMPRESS")) {
-                        uint8_t pal2[2];
-                        uint8_t *mask2;
-                        int mask_bytes2;
-                        compress_island_2col(
-                            s->quant,
-                            g.padded_w,
-                            &islands[isl_i],
-                            pal2,
-                            &mask2,
-                            &mask_bytes2
-                            );
-                        fprintf(
-                            stdout,
-                            "[slot %u][island %d] compressed → palette=(%02X,%02X) mask_bytes=%d\n",
-                                i, isl_i, pal2[0], pal2[1], mask_bytes2
-                            );
-                        /* free(mask2); */
-
-
-                        // 1f) Отладочный дамп: распаковать и сохранить остров
-                        if (getenv("XCAP_DEBUG_DECOMPRESS")) {
-                            char dfn[64];
-                            struct timespec dt;
-                            clock_gettime(CLOCK_REALTIME, &dt);
-                            snprintf(dfn, sizeof(dfn),
-                                     "dbg_decomp_%u_%d_%ld.png",
-                                     i, isl_i, dt.tv_sec);
-                            decompress_island_to_png(
-                                dfn,
-                                &islands[isl_i],
-                                g.padded_w,
-                                pal2,
-                                mask2
-                                );
-                        }
-
-                        free(mask2);
-
-                    }
-
-
-                    /* */
-                }
-
-
-                // 2) Дополнительно можно вывести PNG с островами
-                char fn[64];
-                struct timespec t;
-                clock_gettime(CLOCK_REALTIME, &t);
-                snprintf(fn, sizeof(fn), "dbg_islands_%u_%ld.png", i, t.tv_sec);
-                printf("-- out no 1\n");
-
-                dump_islands_png(fn, s->quant, islands, island_n);
-
-                printf("-- out no 2\n");
-
-
-                // 1g) Отладка: вывести все острова на общей картинке
-                if (getenv("XCAP_DEBUG_ALL_ISLANDS")) {
-                    char afn[64];
-                    struct timespec ta;
-                    clock_gettime(CLOCK_REALTIME, &ta);
-                    snprintf(afn, sizeof(afn),
-                             "dbg_all_islands_%u_%ld.png",
-                             i, ta.tv_sec);
-                    dump_all_islands_png(
-                        afn,
-                        s->quant,
-                        g.padded_w,
-                        islands,
-                        island_n
+                        pal2,
+                        mask2
                         );
                 }
 
+                // Здесь мы заканчиваем работу с палитрой и ее можно освободить
+                free(palette);
+                free(counts);
+                free(mask2);
 
-
-                // 3) Теперь очищаем все blocks и сам массив islands
-                for (int isl_i = 0; isl_i < island_n; ++isl_i) {
-                    free(islands[isl_i].blocks);
-                }
-
-                printf("-- out no 3\n");
-
-                free(islands);
-
-                printf("-- out no 4\n");
-
+                /* */
             }
 
-            printf("-- out no 5\n");
+
+            // 2) Дополнительно можно вывести PNG с островами
+            char fn[64];
+            struct timespec t;
+            clock_gettime(CLOCK_REALTIME, &t);
+            snprintf(fn, sizeof(fn), "dbg_islands_%u_%ld.png", i, t.tv_sec);
+            printf("-- out no 1\n");
+
+            dump_islands_png(fn, s->quant, islands, island_n);
+
+            printf("-- out no 2\n");
+
+
+            // 1g) Отладка: вывести все острова на общей картинке
+            if (getenv("XCAP_DEBUG_ALL_ISLANDS")) {
+                char afn[64];
+                struct timespec ta;
+                clock_gettime(CLOCK_REALTIME, &ta);
+                snprintf(afn, sizeof(afn),
+                         "dbg_all_islands_%u_%ld.png",
+                         i, ta.tv_sec);
+                dump_all_islands_png(
+                    afn,
+                    s->quant,
+                    g.padded_w,
+                    islands,
+                    island_n
+                    );
+            }
+
+
+
+            // 3) Теперь очищаем все blocks и сам массив islands
+            for (int isl_i = 0; isl_i < island_n; ++isl_i) {
+                free(islands[isl_i].blocks);
+            }
+
+            printf("-- out no 3\n");
+
+            free(islands);
+
+            printf("-- out no 4\n");
+
 
 
             /* // 2) Отладочный вывод: записать информацию по каждому блоку в файл */
