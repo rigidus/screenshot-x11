@@ -51,6 +51,10 @@
 #define MIN(a,b) ((a) < (b) ? (a) : (b))
 #endif
 
+#ifndef MAX
+#define MAX(a,b) ((a) > (b) ? (a) : (b))
+#endif
+
 #define DEFAULT_SLOTS 4
 #define MAX_SLOTS     8
 #define COLOR_MIXED   0xFFFF
@@ -117,6 +121,10 @@ typedef struct {
     int *blocks;   // массив индексов блоков (row*cols + col)
     int  count;
     int  cap;
+    int minx, miny, maxx, maxy; // bounding box in pixels
+    uint8_t bg_color;  // background palette index
+    uint8_t fg_color;  // foreground palette index
+    int total_pixels;
 } Island;
 
 
@@ -1422,6 +1430,89 @@ static void debug_dump_filled(const uint8_t *quant,
 #endif
 
 
+/** вычисляет пиксельный bounding box для острова, исходя из списка 32×32 блоков. */
+static void compute_island_bbox(Island *isl) {
+    int bs = BLOCK_SIZE;
+    isl->minx = INT_MAX; isl->miny = INT_MAX;
+    isl->maxx = 0; isl->maxy = 0;
+    for (int i = 0; i < isl->count; ++i) {
+        int b = isl->blocks[i];
+        int by = b / g.block_cols, bx = b % g.block_cols;
+        int x0 = bx * bs, y0 = by * bs;
+        isl->minx = MIN(isl->minx, x0);
+        isl->miny = MIN(isl->miny, y0);
+        isl->maxx = MAX(isl->maxx, x0 + bs - 1);
+        isl->maxy = MAX(isl->maxy, y0 + bs - 1);
+    }
+}
+
+/** по bbox-а объединяет пересекающиеся острова до устойчивого разбиения. */
+static bool bbox_intersect(const Island *a, const Island *b) {
+    return !(a->maxx < b->minx || b->maxx < a->minx
+             || a->maxy < b->miny || b->maxy < a->miny);
+}
+
+
+/**
+ * Merges any islands whose bounding boxes intersect (or one contains the other).
+ *
+ * @param list        Array of Island structures (each with valid minx, miny, maxx, maxy).
+ * @param n_islands   Pointer to the number of islands in list; updated on return.
+ * @returns           Pointer to the (possibly reallocated) list array.
+ */
+static Island* merge_islands(Island *list, int *n_islands) {
+    int n = *n_islands;
+    bool merged_any;
+
+    do {
+        merged_any = false;
+
+        for (int i = 0; i < n; ++i) {
+            for (int j = i + 1; j < n; ++j) {
+                // If the bounding boxes overlap or touch
+                if (!(list[i].maxx < list[j].minx ||
+                      list[j].maxx < list[i].minx ||
+                      list[i].maxy < list[j].miny ||
+                      list[j].maxy < list[i].miny)) {
+                    Island *a = &list[i];
+                    Island *b = &list[j];
+
+                    // Ensure capacity for merged blocks
+                    int new_count = a->count + b->count;
+                    if (new_count > a->cap) {
+                        a->cap = new_count;
+                        a->blocks = realloc(a->blocks, a->cap * sizeof(int));
+                        if (!a->blocks) die("merge_islands: realloc failed");
+                    }
+
+                    // Append b's blocks into a
+                    memcpy(a->blocks + a->count,
+                           b->blocks,
+                           b->count * sizeof(int));
+                    a->count = new_count;
+
+                    // Recompute a's bounding box
+                    compute_island_bbox(a);
+
+                    // Free b's block array
+                    free(b->blocks);
+
+                    // Remove b from the list by shifting subsequent entries left
+                    memmove(&list[j],  &list[j+1],  (n - j - 1) * sizeof(Island));
+                    --n;
+
+                    merged_any = true;
+                    break;  // restart scanning from i=0
+                }
+            }
+            if (merged_any) break;
+        }
+    } while (merged_any);
+
+    *n_islands = n;
+    return list;
+}
+
 
 static uint8_t * _sort_palette;
 static int     * _sort_counts;
@@ -1432,6 +1523,29 @@ static int cmp_order_desc(const void *pa, const void *pb) {
     return _sort_counts[_sort_palette[ib]]
         - _sort_counts[_sort_palette[ia]];
 }
+
+/** собирает палитру/гистограмму с учётом RGB332, сортирует цвета по частоте, сохраняет в структуре фон и «второй» цвет. */
+static void classify_island(Island *isl, const uint8_t *quant) {
+    // collect palette and counts
+    uint8_t *palette; int palette_n; int *counts;
+    collect_palette_hist(quant, g.padded_w, isl, &palette, &palette_n, &counts);
+    // total pixels
+    int total = isl->count * BLOCK_SIZE * BLOCK_SIZE;
+    isl->total_pixels = total;
+    // sort by frequency
+    int order[256];
+    for (int i = 0; i < palette_n; ++i) order[i] = i;
+    _sort_palette = palette;
+    _sort_counts = counts;
+    qsort(order, palette_n, sizeof(int), cmp_order_desc);
+    // set bg and fg
+    isl->bg_color = palette[order[0]];
+    isl->fg_color = (palette_n > 1) ? palette[order[1]] : isl->bg_color;
+    // cleanup
+    free(palette);
+    free(counts);
+}
+
 
 
 
@@ -1484,145 +1598,155 @@ static void *worker_thread(void *arg)
             Island *islands = detect_mixed_islands(
                 s->color, g.block_rows, g.block_cols, &island_n);
 
-            // === собрать для "островов" MIXED-блоков палитру
+            // In worker_thread after detecting islands:
+            int n;
+            Island *isl_list = detect_mixed_islands(s->color, g.block_rows, g.block_cols, &n);
+            for (int i = 0; i < n; ++i) compute_island_bbox(&isl_list[i]);
+            isl_list = merge_islands(isl_list, &n);
+            for (int i = 0; i < n; ++i) classify_island(&isl_list[i], s->quant);
+            // use isl_list[], each has updated bbox, bg_color, fg_color, total_pixels
+            // ... later free blocks and isl_list
 
-            // 1) Печатаем палитры для каждого острова
-            for (int isl_i = 0; isl_i < island_n; ++isl_i) {
-                Island *isl = &islands[isl_i];
-                uint8_t *palette;   // содержат 8-битные цвета
-                int      palette_n; // длина массива palette
-                int     *counts;    // cnt[i] — частота цвета palette[i].
-                // Собираем палитру и гистограмму частот
-                // Принимает:
-                //    s->quant - RGB332-byte per px
-                //    isl - остров
-                // Возвращает:
-                //    *palette   - палитру, динамически выделенный массив байт,
-                //                 каждый — это уникальный цвет.
-                //    *palette_n - количество элементов палитры
-                // Выделяет:
-                //    *palette
-                //    *counts
-                collect_palette_hist(
-                    s->quant,       // RGB332-byte per px
-                    g.padded_w,
-                    isl,
-                    &palette,
-                    &palette_n,
-                    &counts
-                    );
 
-                // Выводим размер и содержимое палитры
-                fprintf(stdout,
-                        "[slot %u] island %d: blocks=%d palette=%d:",
-                        i, isl_i, (&islands[isl_i])->count, palette_n);
-                for (int pi = 0; pi < palette_n; ++pi) {
-                    fprintf(stdout, " %02X", palette[pi]);
-                }
-                fprintf(stdout, "\n");
+            /* // === собрать для "островов" MIXED-блоков палитру */
 
-                /* [TODO:] Здесь нужно сливать острова если один находится внутри другого */
+            /* // Для каждого острова... */
+            /* for (int isl_i = 0; isl_i < island_n; ++isl_i) { */
+            /*     Island *isl = &islands[isl_i]; */
+            /*     uint8_t *palette;   // содержат 8-битные цвета */
+            /*     int      palette_n; // длина массива palette */
+            /*     int     *counts;    // cnt[i] — частота цвета palette[i]. */
+            /*     // Собираем палитру и гистограмму частот */
+            /*     // Принимает: */
+            /*     //    s->quant - RGB332-byte per px */
+            /*     //    isl - остров */
+            /*     // Возвращает: */
+            /*     //    *palette   - палитру, динамически выделенный массив байт, */
+            /*     //                 каждый — это уникальный цвет. */
+            /*     //    *palette_n - количество элементов палитры */
+            /*     // Выделяет: */
+            /*     //    *palette */
+            /*     //    *counts */
+            /*     collect_palette_hist( */
+            /*         s->quant,       // RGB332-byte per px */
+            /*         g.padded_w, */
+            /*         isl, */
+            /*         &palette, */
+            /*         &palette_n, */
+            /*         &counts */
+            /*         ); */
 
-                /* CLASSIFY */
+            /*     // Выводим размер и содержимое палитры */
+            /*     fprintf(stdout, */
+            /*             "[slot %u] island %d: blocks=%d palette=%d:", */
+            /*             i, isl_i, (&islands[isl_i])->count, palette_n); */
+            /*     for (int pi = 0; pi < palette_n; ++pi) { */
+            /*         fprintf(stdout, " %02X", palette[pi]); */
+            /*     } */
+            /*     fprintf(stdout, "\n"); */
 
-                /* Сортируем индексы цвета palette по убыванию cnt. */
-                int order[64]; // массив индексов order, ссылаеющихся на элементы палитры
-                if (palette_n > 0 && palette_n <= 64) {
-                    /* заполняем массив order */
-                    for (int k = 0; k < palette_n; ++k) order[k] = k;
-                    // По окончании сортировки
-                    // order[0] указывает на наиболее частый цвет,
-                    // order [1] — на второй по частоте и так далее
-                    _sort_palette = palette;
-                    _sort_counts  = counts;
-                    qsort(order, palette_n, sizeof *order, cmp_order_desc);
-                }
+            /*     /\* [TODO:] Здесь нужно сливать острова если один находится внутри другого *\/ */
 
-                // Считаем сколько всего пикселей в острове
-                int total = 0;
-                for (int pi = 0; pi < palette_n; ++pi) {
-                    total += counts[ palette[pi] ];
-                }
-                // Цвет фона - это самый частый цвет
-                int bgc = counts[ palette[ order[0] ] ];
-                // Цвет текста - скорее всего второй по частоте
-                int txc = (palette_n > 1 ? counts[ palette[ order[1] ] ] : 0);
-                /* Доля фонового цвета cnt[0]/total_pixels (должна быть большая) */
-                float bg_frac = (float)bgc / total;
-                /* Доля текста cnt[1]/total_pixels (должна быть ненулевая) */
-                float fg_frac = (float)txc / total;
+            /*     /\* CLASSIFY *\/ */
 
-                // Вычисляем минимальный ограничивающий прямоугольник («bounding box»)
-                // данного острова в пиксельных координатах
-                int minx = g.w, miny = g.h, maxx = 0, maxy = 0;
-                for (int j = 0; j < islands[isl_i].count; ++j) {
-                    int b = islands[isl_i].blocks[j];
-                    int by = b / g.block_cols;
-                    int bx = b % g.block_cols;
-                    int x0 = bx * BLOCK_SIZE;
-                    int y0 = by * BLOCK_SIZE;
-                    if (x0 < minx) minx = x0;
-                    if (y0 < miny) miny = y0;
-                    if (x0 + BLOCK_SIZE - 1 > maxx) maxx = x0 + BLOCK_SIZE - 1;
-                    if (y0 + BLOCK_SIZE - 1 > maxy) maxy = y0 + BLOCK_SIZE - 1;
-                }
-                // Вычисляем отношение сторон
-                float shape_ratio = (float)(maxx - minx + 1) / (maxy - miny + 1);
-                // Вычисляем похожесть острова на текст
-                bool is_text = (palette_n <= 16)
-                    && (bg_frac >= 0.6f)
-                    && (fg_frac >= 0.03f)
-                    /* && (shape_ratio >= 4.0f) */
-                    ;
+            /*     /\* Сортируем индексы цвета palette по убыванию cnt. *\/ */
+            /*     int order[64]; // массив индексов order, ссылаеющихся на элементы палитры */
+            /*     if (palette_n > 0 && palette_n <= 64) { */
+            /*         /\* заполняем массив order *\/ */
+            /*         for (int k = 0; k < palette_n; ++k) order[k] = k; */
+            /*         // По окончании сортировки */
+            /*         // order[0] указывает на наиболее частый цвет, */
+            /*         // order [1] — на второй по частоте и так далее */
+            /*         _sort_palette = palette; */
+            /*         _sort_counts  = counts; */
+            /*         qsort(order, palette_n, sizeof *order, cmp_order_desc); */
+            /*     } */
 
-                fprintf(
-                    stdout,
-                    "[slot %u][island %d] palette=%d total_px=%d bg=%.2f fg=%.2f shape=%.1f => %s\n",
-                    i, isl_i, palette_n, total, bg_frac, fg_frac, shape_ratio,
-                    is_text ? "TEXT" : "GRAPHIC");
+            /*     // Считаем сколько всего пикселей в острове */
+            /*     int total = 0; */
+            /*     for (int pi = 0; pi < palette_n; ++pi) { */
+            /*         total += counts[ palette[pi] ]; */
+            /*     } */
+            /*     // Цвет фона - это самый частый цвет */
+            /*     int bgc = counts[ palette[ order[0] ] ]; */
+            /*     // Цвет текста - скорее всего второй по частоте */
+            /*     int txc = (palette_n > 1 ? counts[ palette[ order[1] ] ] : 0); */
+            /*     /\* Доля фонового цвета cnt[0]/total_pixels (должна быть большая) *\/ */
+            /*     float bg_frac = (float)bgc / total; */
+            /*     /\* Доля текста cnt[1]/total_pixels (должна быть ненулевая) *\/ */
+            /*     float fg_frac = (float)txc / total; */
 
-                /* END_CLASSIFY */
+            /*     // Вычисляем минимальный ограничивающий прямоугольник («bounding box») */
+            /*     // данного острова в пиксельных координатах */
+            /*     int minx = g.w, miny = g.h, maxx = 0, maxy = 0; */
+            /*     for (int j = 0; j < islands[isl_i].count; ++j) { */
+            /*         int b = islands[isl_i].blocks[j]; */
+            /*         int by = b / g.block_cols; */
+            /*         int bx = b % g.block_cols; */
+            /*         int x0 = bx * BLOCK_SIZE; */
+            /*         int y0 = by * BLOCK_SIZE; */
+            /*         if (x0 < minx) minx = x0; */
+            /*         if (y0 < miny) miny = y0; */
+            /*         if (x0 + BLOCK_SIZE - 1 > maxx) maxx = x0 + BLOCK_SIZE - 1; */
+            /*         if (y0 + BLOCK_SIZE - 1 > maxy) maxy = y0 + BLOCK_SIZE - 1; */
+            /*     } */
+            /*     // Вычисляем отношение сторон */
+            /*     float shape_ratio = (float)(maxx - minx + 1) / (maxy - miny + 1); */
+            /*     // Вычисляем похожесть острова на текст */
+            /*     bool is_text = (palette_n <= 16) */
+            /*         && (bg_frac >= 0.6f) */
+            /*         && (fg_frac >= 0.03f) */
+            /*         /\* && (shape_ratio >= 4.0f) *\/ */
+            /*         ; */
 
-                /* // 1e) Отладка: сжать каждый остров 2-цветной палитрой */
-                /* uint8_t pal2[2], *mask2; */
-                /* int mask_bytes2; */
-                /* compress_island_2col_simple( */
-                /*     s->quant, g.padded_w, */
-                /*     &islands[isl_i], */
-                /*     palette, palette_n, */
-                /*     counts, */
-                /*     pal2, &mask2, &mask_bytes2 */
-                /*     ); */
-                /* fprintf( */
-                /*     stdout, */
-                /*     "[slot %u][island %d] compressed → palette=(%02X,%02X) mask_bytes=%d\n", */
-                /*     i, isl_i, pal2[0], pal2[1], mask_bytes2 */
-                /*     ); */
+            /*     fprintf( */
+            /*         stdout, */
+            /*         "[slot %u][island %d] palette=%d total_px=%d bg=%.2f fg=%.2f shape=%.1f => %s\n", */
+            /*         i, isl_i, palette_n, total, bg_frac, fg_frac, shape_ratio, */
+            /*         is_text ? "TEXT" : "GRAPHIC"); */
 
-                /* // 1f) Отладочный дамп: распаковать и сохранить остров */
-                /* if (getenv("XCAP_DEBUG_DECOMPRESS")) { */
-                /*     char dfn[64]; */
-                /*     struct timespec dt; */
-                /*     clock_gettime(CLOCK_REALTIME, &dt); */
-                /*     snprintf(dfn, sizeof(dfn), */
-                /*              "dbg_decomp_%u_%d_%ld.png", */
-                /*              i, isl_i, dt.tv_sec); */
-                /*     decompress_island_to_png( */
-                /*         dfn, */
-                /*         &islands[isl_i], */
-                /*         g.padded_w, */
-                /*         pal2, */
-                /*         mask2 */
-                /*         ); */
-                /* } */
+            /*     /\* END_CLASSIFY *\/ */
 
-                // Здесь мы заканчиваем работу с палитрой и ее можно освободить
-                free(palette);
-                free(counts);
-                /* free(mask2); */
+            /*     // 1e) Отладка: сжать каждый остров 2-цветной палитрой */
+            /*     uint8_t pal2[2], *mask2; */
+            /*     int mask_bytes2; */
+            /*     compress_island_2col_simple( */
+            /*         s->quant, g.padded_w, */
+            /*         &islands[isl_i], */
+            /*         palette, palette_n, */
+            /*         counts, */
+            /*         pal2, &mask2, &mask_bytes2 */
+            /*         ); */
+            /*     fprintf( */
+            /*         stdout, */
+            /*         "[slot %u][island %d] compressed → palette=(%02X,%02X) mask_bytes=%d\n", */
+            /*         i, isl_i, pal2[0], pal2[1], mask_bytes2 */
+            /*         ); */
 
-                /* */
-            }
+            /*     // 1f) Отладочный дамп: распаковать и сохранить остров */
+            /*     if (getenv("XCAP_DEBUG_DECOMPRESS")) { */
+            /*         char dfn[64]; */
+            /*         struct timespec dt; */
+            /*         clock_gettime(CLOCK_REALTIME, &dt); */
+            /*         snprintf(dfn, sizeof(dfn), */
+            /*                  "dbg_decomp_%u_%d_%ld.png", */
+            /*                  i, isl_i, dt.tv_sec); */
+            /*         decompress_island_to_png( */
+            /*             dfn, */
+            /*             &islands[isl_i], */
+            /*             g.padded_w, */
+            /*             pal2, */
+            /*             mask2 */
+            /*             ); */
+            /*     } */
+
+            /*     // Здесь мы заканчиваем работу с палитрой и ее можно освободить */
+            /*     free(palette); */
+            /*     free(counts); */
+            /*     /\* free(mask2); *\/ */
+
+            /*     /\* *\/ */
+            /* } */
 
 
             // 2) Дополнительно можно вывести PNG с островами
@@ -1655,14 +1779,15 @@ static void *worker_thread(void *arg)
             }
 
 
+            for (int i = 0; i < n; ++i)
+                free(isl_list[i].blocks);
+            free(isl_list);
 
-            // 3) Теперь очищаем все blocks и сам массив islands
+
+            // Теперь очищаем все blocks и сам массив islands
             for (int isl_i = 0; isl_i < island_n; ++isl_i) {
                 free(islands[isl_i].blocks);
             }
-
-            printf("-- out no 3\n");
-
             free(islands);
 
             printf("-- out no 4\n");
