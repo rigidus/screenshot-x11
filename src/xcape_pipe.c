@@ -152,7 +152,7 @@ static void allocate_bigmem(void)
     //  base
     //  ├── quant : [raw_sz .. raw_sz+q_sz)
     //  └── color : [raw_sz+q_sz .. raw_sz+q_sz+col_sz)
-    size_t q_sz     = (size_t)g.w*g.h*2;                    // RGB555
+    size_t q_sz     = (size_t)g.w*g.h;                    // RGB322
     size_t col_sz = (size_t)g.block_count * sizeof(uint8_t);  // цвет каждого 8×8-блока
     size_t per_slot = q_sz + col_sz;                        // один slot
     g.bigmem_sz     = per_slot * g.slots;                   // все slots
@@ -228,142 +228,174 @@ static void init_x11(void)
 
 /* ═════════════════════════ SIMD RGB888→RGB222 ═════════════════════════════ */
 
-#define BLOCK_SIZE    8
+#define BLOCK_SIZE    16
 #define MIXED         0xFF
-#define TRANSP_BIT    0x80  // binary:1000.0000
 
-
-// Проверка поддержки AVX2 (разовая, в init)
-static bool have_avx2(void) {
-    uint32_t a, b, c, d;
-    __asm__ volatile(
-        "cpuid\n\t"
-        : "=a"(a), "=b"(b), "=c"(c), "=d"(d)
-        : "a"(0), "c"(0)
-        );
-    // Узнаём feature bits через CPUID leaf 7 subleaf 0
-    __asm__ volatile(
-        "cpuid\n\t"
-        : "=a"(a), "=b"(b), "=c"(c), "=d"(d)
-        : "a"(7), "c"(0)
-        );
-    return (b & (1 << 5)) != 0; // AVX2 bit in EBX
-}
 
 // Расширение 2-бит → 8-бит
 static inline uint8_t expand2(uint8_t v) {
     return (uint8_t)((v << 6) | (v << 4) | (v << 2) | v);
 }
 
+// Расширение 3-бит → 8-бит
+static inline uint8_t expand3(uint8_t v) {
+    return (uint8_t)((v << 5) | (v << 2) | (v >> 1));
+}
+
+// CPUID‐утилита для AVX2
+static inline bool have_avx2(void) {
+    uint32_t a, b, c, d;
+    __asm__ volatile("cpuid"
+                     : "=a"(a), "=b"(b), "=c"(c), "=d"(d)
+                     : "a"(7), "c"(0)
+        );
+    return (b & (1<<5)) != 0;  // AVX2 в EBX[5]
+}
+
+// CPUID‐проверка AVX2
+static inline bool cpu_has_avx2(void) {
+    uint32_t a, b, c, d;
+    __asm__ volatile("cpuid"
+                     : "=a"(a), "=b"(b), "=c"(c), "=d"(d)
+                     : "a"(7), "c"(0)
+        );
+    return (b & (1<<5)) != 0;  // EBX[5] = AVX2
+}
+
+
+// SIMD‐проверка однородности 32-байтного региона
+static inline bool block_uniform_avx2(
+    const uint8_t *quant, int pw, int sy, int sx
+    ) {
+    uint8_t base = quant[sy*pw + sx];
+    if (base == 0) return true;  // весь блок из нулей
+    __m256i v_base = _mm256_set1_epi8((char)base);
+    __m256i v_zero = _mm256_setzero_si256();
+    for (int dy = 0; dy < BLOCK_SIZE; ++dy) {
+        const uint8_t *row = quant + (sy + dy)*pw + sx;
+        __m256i v   = _mm256_loadu_si256((const __m256i*)row);
+        __m256i cmpb = _mm256_cmpeq_epi8(v, v_base);
+        __m256i cmp0 = _mm256_cmpeq_epi8(v, v_zero);
+        __m256i ok   = _mm256_or_si256(cmpb, cmp0);
+        uint32_t mask = _mm256_movemask_epi8(ok);
+        if (mask != 0xFFFFFFFFu) return false;
+    }
+    return true;
+}
+
 static void quantize_and_analyze(
-    const uint8_t *src0,         // ARGB8888, stride = w*4
-    uint8_t       *quant,        // буфер [padded_w * padded_h]
-    uint8_t       *block_color,  // буфер [block_count]
+    const uint8_t *src0,      // ARGB8888, stride = w*4
+    uint8_t       *quant,     // [padded_h][padded_w]
+    uint8_t       *block_color, // [block_count]
     int            w,
     int            h
     ) {
-    int pw = g.padded_w;
-    int ph = g.padded_h;
-    int bc = g.block_cols;
-    int br = g.block_rows;
+    const int pw = g.padded_w;
+    const int ph = g.padded_h;
+    const int bc = g.block_cols;
+    const int br = g.block_rows;
 
-    // Инициализация цветов блоков
-    for (int i = 0; i < br * bc; ++i) {
+    // Однократный детект AVX2
+    static bool inited = false;
+    static bool use256;
+    if (!inited) {
+        use256 = cpu_has_avx2();
+        inited = true;
+    }
+
+    // Инициализация состояний блоков
+    for (int i = 0; i < br*bc; ++i) {
         block_color[i] = MIXED;
     }
 
-    // Обход по строкам: отдельно для src (ширина w) и quant (ширина pw)
+    // 1) Квантование RGB888 → RGB332 (AVX2/SSE2/scalar)
     for (int y = 0; y < ph; ++y) {
-        const uint8_t *row_src = src0  + (size_t)y * w * 4;
+        const uint8_t *row_src = src0 + (size_t)y * w * 4;
         uint8_t       *row_q   = quant + (size_t)y * pw;
         int x = 0;
 
-        // --- векторное квантование ---
-        if (have_avx2()) {
-            __m256i mask2 = _mm256_set1_epi32(0xC0);
-            // AVX2: по 8 пикселей
-            for (; x + 8 <= w; x += 8) {
+        if (use256) {
+            __m256i mR = _mm256_set1_epi32(0xE0);
+            __m256i mB = _mm256_set1_epi32(0xC0);
+            int lim8 = (w/8)*8;
+            for (; x < lim8; x += 8) {
                 __m256i pix = _mm256_loadu_si256((__m256i*)(row_src + x*4));
-                __m256i r = _mm256_and_si256(_mm256_srli_epi32(pix,16), mask2);
-                __m256i g2= _mm256_and_si256(_mm256_srli_epi32(pix, 8), mask2);
-                __m256i b = _mm256_and_si256(pix,               mask2);
-                __m256i rg = _mm256_or_si256(r, _mm256_srli_epi32(g2,2));
-                __m256i rgb= _mm256_or_si256(rg, _mm256_srli_epi32(b,4));
-                __m128i lo = _mm256_castsi256_si128(rgb);
-                __m128i hi = _mm256_extracti128_si256(rgb,1);
+                __m256i r   = _mm256_and_si256(_mm256_srli_epi32(pix,16), mR);
+                __m256i g2  = _mm256_and_si256(_mm256_srli_epi32(pix, 8), mR);
+                __m256i b   = _mm256_and_si256(pix,               mB);
+                __m256i rg  = _mm256_or_si256(r,  _mm256_srli_epi32(g2,3));
+                __m256i rgb = _mm256_or_si256(rg, _mm256_srli_epi32(b,6));
+                __m128i lo  = _mm256_castsi256_si128(rgb);
+                __m128i hi  = _mm256_extracti128_si256(rgb,1);
                 __m128i p16 = _mm_packus_epi32(lo, hi);
                 __m128i p8  = _mm_packus_epi16(p16, _mm_setzero_si128());
                 _mm_storel_epi64((__m128i*)(row_q + x), p8);
             }
-        } else {
-            __m128i mask2s = _mm_set1_epi32(0xC0);
-            // SSE2: по 4 пикселя
-            for (; x + 4 <= w; x += 4) {
+        }
+        // SSE2
+        {
+            __m128i mR4 = _mm_set1_epi32(0xE0);
+            __m128i mB4 = _mm_set1_epi32(0xC0);
+            int lim4 = (w/4)*4;
+            for (; x < lim4; x += 4) {
                 __m128i pix = _mm_loadu_si128((__m128i*)(row_src + x*4));
-                __m128i r = _mm_and_si128(_mm_srli_epi32(pix,16), mask2s);
-                __m128i g2= _mm_and_si128(_mm_srli_epi32(pix, 8), mask2s);
-                __m128i b = _mm_and_si128(pix,               mask2s);
-                __m128i rg   = _mm_or_si128(r,    _mm_srli_epi32(g2,2));
-                __m128i rgb  = _mm_or_si128(rg,   _mm_srli_epi32(b, 4));
-                __m128i p16  = _mm_packus_epi32(rgb, _mm_setzero_si128());
-                __m128i p8   = _mm_packus_epi16(p16, _mm_setzero_si128());
-                uint32_t v   = _mm_cvtsi128_si32(p8);
-                *(uint32_t*)(row_q + x) = v;
+                __m128i r   = _mm_and_si128(_mm_srli_epi32(pix,16), mR4);
+                __m128i g2  = _mm_and_si128(_mm_srli_epi32(pix, 8), mR4);
+                __m128i b   = _mm_and_si128(pix,               mB4);
+                __m128i rg  = _mm_or_si128(r, _mm_srli_epi32(g2,3));
+                __m128i rgb = _mm_or_si128(rg, _mm_srli_epi32(b,6));
+                __m128i p16 = _mm_packus_epi32(rgb, _mm_setzero_si128());
+                __m128i p8  = _mm_packus_epi16(p16, _mm_setzero_si128());
+                *(uint32_t*)(row_q + x) = _mm_cvtsi128_si32(p8);
             }
         }
-        // остаток по пикселям
+        // Scalar tail + padding
         for (; x < w; ++x) {
-            uint8_t R = row_src[x*4 + 2];
-            uint8_t G = row_src[x*4 + 1];
-            uint8_t B = row_src[x*4 + 0];
-            row_q[x] = (uint8_t)(((R>>6)<<4) | ((G>>6)<<2) | (B>>6));
+            uint8_t R = row_src[x*4+2], G = row_src[x*4+1], B = row_src[x*4+0];
+            uint8_t R3 = R >> 5, G3 = G >> 5, B2 = B >> 6;
+            row_q[x] = (uint8_t)((R3<<5)|(G3<<2)|B2);
         }
-        // padding вправо
         for (; x < pw; ++x) {
-            row_q[x] = TRANSP_BIT;
+            row_q[x] = 0;
         }
     }
 
-    // гарантируем завершение non-temporal store
-    _mm_sfence();
+    _mm_sfence();  // дождаться всех store
 
-    // --- анализ однородности блоков 8×8 ---
+    // 2) Анализ однородности блоков 32×32
     for (int by = 0; by < br; ++by) {
         for (int bx = 0; bx < bc; ++bx) {
-            int idx = by * bc + bx;
-            int sy = by * BLOCK_SIZE;
-            int sx = bx * BLOCK_SIZE;
-            uint8_t base = MIXED;
+            int idx = by*bc + bx;
+            int sy  = by * BLOCK_SIZE;
+            int sx  = bx * BLOCK_SIZE;
 
-            // найти первый непустой пиксель
-            for (int dy = 0; dy < BLOCK_SIZE; ++dy) {
-                for (int dx = 0; dx < BLOCK_SIZE; ++dx) {
-                    uint8_t q = quant[(sy+dy)*pw + (sx+dx)];
-                    if (q & TRANSP_BIT) continue;
-                    base = q;
-                    goto found;
+            bool uniform;
+            if (use256) {
+                uniform = block_uniform_avx2(quant, pw, sy, sx);
+            } else {
+                // scalar fallback
+                uint8_t base = quant[sy*pw + sx];
+                if (base == 0) {
+                    uniform = true;
+                } else {
+                    uniform = true;
+                    for (int dy = 0; dy < BLOCK_SIZE && uniform; ++dy) {
+                        for (int dx = 0; dx < BLOCK_SIZE; ++dx) {
+                            uint8_t q = quant[(sy+dy)*pw + (sx+dx)];
+                            if (q != 0 && q != base) {
+                                uniform = false;
+                                break;
+                            }
+                        }
+                    }
                 }
             }
-        found:
-            if (base == MIXED) {
-                block_color[idx] = TRANSP_BIT;  // полностью прозрачный/mixed
-                continue;
-            }
-            // проверить, не отличаются ли остальные
-            for (int dy = 0; dy < BLOCK_SIZE; ++dy) {
-                for (int dx = 0; dx < BLOCK_SIZE; ++dx) {
-                    uint8_t q = quant[(sy+dy)*pw + (sx+dx)];
-                    if ((q & TRANSP_BIT) || q == base) continue;
-                    base = MIXED;
-                    goto done;
-                }
-            }
-        done:
-            block_color[idx] = base;
+            block_color[idx] = uniform
+                ? quant[sy*pw + sx]  // base
+                : MIXED;
         }
     }
 }
-
 
 /* ---------- запись QIMG ------------------------------- */
 static void write_qimg(const FrameSlot *s, const char *fn)
@@ -582,8 +614,8 @@ static void dump_filled_blocks_png(const char *fname,
                         uint8_t r2 = (q >> 4) & 3;
                         uint8_t g2 = (q >> 2) & 3;
                         uint8_t b2 =  q       & 3;
-                        uint8_t r8 = expand2(r2);
-                        uint8_t g8 = expand2(g2);
+                        uint8_t r8 = expand3(r2);
+                        uint8_t g8 = expand3(g2);
                         uint8_t b8 = expand2(b2);
                         size_t p = (size_t)(y0 + dy) * W + (x0 + dx);
                         rgb[p*3 + 0] = r8;
@@ -596,8 +628,8 @@ static void dump_filled_blocks_png(const char *fname,
                 uint8_t r2 = (c >> 4) & 3;
                 uint8_t g2 = (c >> 2) & 3;
                 uint8_t b2 =  c       & 3;
-                uint8_t r8 = expand2(r2);
-                uint8_t g8 = expand2(g2);
+                uint8_t r8 = expand3(r2);
+                uint8_t g8 = expand3(g2);
                 uint8_t b8 = expand2(b2);
                 // заполнить
                 for (int dy = 0; dy < h_blk; ++dy) {
@@ -743,40 +775,6 @@ static Island* detect_mixed_islands(const uint8_t *block_color,
     return list;
 }
 
-/// Собирает уникальный набор квантованных цветов внутри одного острова.
-/// quant — полный буфер [padded_h][padded_w],
-/// rows×cols — количество блоков,
-/// BLOCK_SIZE=8.
-/// Возвращает динамический массив цветов, размер palette_n.
-static uint8_t* collect_palette(const uint8_t *quant,
-                                int padded_w,
-                                const Island *isl,
-                                int *palette_n)
-{
-    // максимально 64 цвета
-    bool seen[256] = {0};
-    uint8_t *palette = malloc(256);
-    int pcount = 0;
-
-    for (int i = 0; i < isl->count; ++i) {
-        int b = isl->blocks[i];
-        int br = b / g.block_cols, bc = b % g.block_cols;
-        int y0 = br * BLOCK_SIZE;
-        int x0 = bc * BLOCK_SIZE;
-        for (int dy=0; dy<BLOCK_SIZE; ++dy) {
-            for (int dx=0; dx<BLOCK_SIZE; ++dx) {
-                uint8_t q = quant[(y0+dy)*padded_w + (x0+dx)];
-                if ((q & TRANSP_BIT)==0 && !seen[q]) {
-                    seen[q] = true;
-                    palette[pcount++] = q;
-                }
-            }
-        }
-    }
-    *palette_n = pcount;
-    return palette;
-}
-
 
 /* signature: palette и counts выделяются внутри и возвращаются через указатели
  * асимптотика O(BLOCK_SIZE² × number_of_blocks_in_island)
@@ -812,7 +810,7 @@ static void collect_palette_hist(
                 // Берём каждый квантованный байт q из буфера quant
                 // (ширина с учётом выравнивания — padded_w).
                 uint8_t q = quant[(y0+dy)*padded_w + (x0+dx)];
-                if (q & TRANSP_BIT) continue; // пропускаем «прозрачные» пиксели
+                /* if (q & TRANSP_BIT) continue; // пропускаем «прозрачные» пиксели */
                 if (!seen[q]) {
                     // первый раз, когда цвет q встречается,
                     // добавляем его в массив palette и отмечаем в seen.
@@ -933,13 +931,12 @@ static void dump_islands_png(const char *fname,
     for (int y = 0; y < H; ++y) {
         for (int x = 0; x < W; ++x) {
             uint8_t q = quant[y * pw + x];
-            uint8_t r2 = (q >> 4) & 3;
-            uint8_t g2 = (q >> 2) & 3;
+            uint8_t r2 = (q >> 5) & 7;
+            uint8_t g2 = (q >> 2) & 7;
             uint8_t b2 =  q       & 3;
-            // expand2 = (v<<6)|(v<<4)|(v<<2)|v
-            rgb[((size_t)y*W + x)*3 + 0] = (r2<<6)|(r2<<4)|(r2<<2)|r2;
-            rgb[((size_t)y*W + x)*3 + 1] = (g2<<6)|(g2<<4)|(g2<<2)|g2;
-            rgb[((size_t)y*W + x)*3 + 2] = (b2<<6)|(b2<<4)|(b2<<2)|b2;
+            rgb[((size_t)y*W + x)*3 + 0] = expand3(r2);
+            rgb[((size_t)y*W + x)*3 + 1] = expand3(g2);
+            rgb[((size_t)y*W + x)*3 + 2] = expand2(b2);
         }
     }
     // 2) для каждого острова — pick цвет и рисуем
@@ -1279,13 +1276,12 @@ void decompress_island_to_png(
                 int cluster = (mask[bitpos >> 3] >> (bitpos & 7)) & 1;
                 uint8_t q = palette[cluster];
                 // расширяем RGB222 → RGB888
-                uint8_t r2 = (q >> 4) & 3;
-                uint8_t g2 = (q >> 2) & 3;
+                uint8_t r2 = (q >> 5) & 7;
+                uint8_t g2 = (q >> 2) & 7;
                 uint8_t b2 =  q       & 3;
-                uint8_t r8 = expand2(r2);
-                uint8_t g8 = expand2(g2);
+                uint8_t r8 = expand3(r2);
+                uint8_t g8 = expand3(g2);
                 uint8_t b8 = expand2(b2);
-
                 int px = xx - minx;
                 int py = yy - miny;
                 size_t off = ((size_t)py * W + px) * 3;
@@ -1875,12 +1871,12 @@ int main(int argc, char **argv) {
     // 3. Инициализация X11 и многосегментный SHM
     init_x11();  // внутри создаются g.slots XImage+SHM
 
-    // 4. Вычисление размеров блоков 8×8 и паддинга
-    g.block_cols  = (g.w + 7) / 8;
-    g.block_rows  = (g.h + 7) / 8;
+    // 4. Вычисление размеров блоков 32×32 и паддинга
+    g.block_cols  = (g.w + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    g.block_rows  = (g.h + BLOCK_SIZE - 1) / BLOCK_SIZE;
     g.block_count = g.block_cols * g.block_rows;
-    g.padded_w    = g.block_cols * 8;
-    g.padded_h    = g.block_rows * 8;
+    g.padded_w    = g.block_cols * BLOCK_SIZE;  // теперь ≥ w и кратно 32
+    g.padded_h    = g.block_rows * BLOCK_SIZE;  // теперь ≥ h и кратно 32
 
     fprintf(stdout,
             "[init] screen %dx%d, padded %dx%d, blocks %dx%d (%d total)\n",
