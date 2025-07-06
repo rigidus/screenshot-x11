@@ -901,6 +901,22 @@ static void draw_island_bbox(uint8_t *rgb, int W, int H,
             }
         }
     }
+    // 6) дополнительная рамка цветом #7F7F7F
+    uint8_t gr = 0x7F, gg2 = 0x7F, gb = 0x7F;
+    // верх/низ
+    for (int x = minx; x <= maxx; ++x) {
+        size_t p1 = miny * W + x;
+        size_t p2 = maxy * W + x;
+        rgb[p1*3+0] = gr; rgb[p1*3+1] = gg2; rgb[p1*3+2] = gb;
+        rgb[p2*3+0] = gr; rgb[p2*3+1] = gg2; rgb[p2*3+2] = gb;
+    }
+    // лево/право
+    for (int y = miny; y <= maxy; ++y) {
+        size_t p1 = (size_t)y * W + minx;
+        size_t p2 = (size_t)y * W + maxx;
+        rgb[p1*3+0] = gr; rgb[p1*3+1] = gg2; rgb[p1*3+2] = gb;
+        rgb[p2*3+0] = gr; rgb[p2*3+1] = gg2; rgb[p2*3+2] = gb;
+    }
 }
 
 
@@ -1114,6 +1130,79 @@ void compress_island_2col_fast(
     }
 
     *out_mask        = m;
+    *out_mask_bytes  = bytes;
+}
+
+
+/**
+ * Упрощённая сжатая версия «острова»:
+ *   - на выходе два цвета: фон и «всё остальное»,
+ *   - битовая маска: 0=фон, 1=любой другой цвет.
+ *
+ * @param quant           входной буфер RGB222 [padded_h][padded_w]
+ * @param padded_w        ширина quant с паддингом
+ * @param isl             остров (список блоков)
+ * @param palette         уже собранная palette[palette_n]
+ * @param palette_n       длина palette
+ * @param counts          гистограмма counts[0..255]
+ *
+ * @param out_pal2        uint8_t[2]: [0]=фон, [1]=второй по частоте или fallback
+ * @param out_mask        указатель на битовую маску (malloc внутри)
+ * @param out_mask_bytes  размер маски в байтах
+ */
+void compress_island_2col_simple(
+    const uint8_t   *quant,
+    int              padded_w,
+    const Island    *isl,
+    const uint8_t   *palette,
+    int              palette_n,
+    const int       *counts,
+    uint8_t          out_pal2[2],
+    uint8_t        **out_mask,
+    int             *out_mask_bytes
+    ) {
+    // 1) Находим фон: наиболее частый цвет
+    int best0 = 0;
+    for (int i = 1; i < palette_n; ++i) {
+        if (counts[ palette[i] ] > counts[ palette[best0] ])
+            best0 = i;
+    }
+    uint8_t c0 = palette[best0];
+
+    // 2) Второй по частоте цвет (или fallback)
+    int best1 = -1;
+    for (int i = 0; i < palette_n; ++i) {
+        if (i == best0) continue;
+        if (best1 < 0 || counts[ palette[i] ] > counts[ palette[best1] ])
+            best1 = i;
+    }
+    uint8_t c1 = (best1 >= 0 ? palette[best1] : (c0 ^ 0x3F));
+
+    out_pal2[0] = c0;
+    out_pal2[1] = c1;
+
+    // 3) Строим битовую маску: 0 для фоновых пикселей, 1 для любых других
+    int pixels = isl->count * BLOCK_SIZE * BLOCK_SIZE;
+    int bytes  = (pixels + 7) / 8;
+    uint8_t *mask = calloc(bytes, 1);
+    int bitpos = 0;
+
+    for (int bi = 0; bi < isl->count; ++bi) {
+        int b  = isl->blocks[bi];
+        int by = b / g.block_cols, bx = b % g.block_cols;
+        int y0 = by * BLOCK_SIZE, x0 = bx * BLOCK_SIZE;
+
+        for (int dy = 0; dy < BLOCK_SIZE; ++dy) {
+            for (int dx = 0; dx < BLOCK_SIZE; ++dx, ++bitpos) {
+                uint8_t q = quant[(y0 + dy) * padded_w + (x0 + dx)];
+                if (q != c0) {
+                    mask[bitpos >> 3] |= (1 << (bitpos & 7));
+                }
+            }
+        }
+    }
+
+    *out_mask        = mask;
     *out_mask_bytes  = bytes;
 }
 
@@ -1496,43 +1585,43 @@ static void *worker_thread(void *arg)
 
                 /* END_CLASSIFY */
 
-                // 1e) Отладка: сжать каждый остров 2-цветной палитрой
-                uint8_t pal2[2], *mask2;
-                int mask_bytes2;
-                compress_island_2col_fast(
-                    s->quant, g.padded_w,
-                    &islands[isl_i],
-                    palette, palette_n,
-                    counts,
-                    pal2, &mask2, &mask_bytes2
-                    );
-                fprintf(
-                    stdout,
-                    "[slot %u][island %d] compressed → palette=(%02X,%02X) mask_bytes=%d\n",
-                    i, isl_i, pal2[0], pal2[1], mask_bytes2
-                    );
+                /* // 1e) Отладка: сжать каждый остров 2-цветной палитрой */
+                /* uint8_t pal2[2], *mask2; */
+                /* int mask_bytes2; */
+                /* compress_island_2col_simple( */
+                /*     s->quant, g.padded_w, */
+                /*     &islands[isl_i], */
+                /*     palette, palette_n, */
+                /*     counts, */
+                /*     pal2, &mask2, &mask_bytes2 */
+                /*     ); */
+                /* fprintf( */
+                /*     stdout, */
+                /*     "[slot %u][island %d] compressed → palette=(%02X,%02X) mask_bytes=%d\n", */
+                /*     i, isl_i, pal2[0], pal2[1], mask_bytes2 */
+                /*     ); */
 
-                // 1f) Отладочный дамп: распаковать и сохранить остров
-                if (getenv("XCAP_DEBUG_DECOMPRESS")) {
-                    char dfn[64];
-                    struct timespec dt;
-                    clock_gettime(CLOCK_REALTIME, &dt);
-                    snprintf(dfn, sizeof(dfn),
-                             "dbg_decomp_%u_%d_%ld.png",
-                             i, isl_i, dt.tv_sec);
-                    decompress_island_to_png(
-                        dfn,
-                        &islands[isl_i],
-                        g.padded_w,
-                        pal2,
-                        mask2
-                        );
-                }
+                /* // 1f) Отладочный дамп: распаковать и сохранить остров */
+                /* if (getenv("XCAP_DEBUG_DECOMPRESS")) { */
+                /*     char dfn[64]; */
+                /*     struct timespec dt; */
+                /*     clock_gettime(CLOCK_REALTIME, &dt); */
+                /*     snprintf(dfn, sizeof(dfn), */
+                /*              "dbg_decomp_%u_%d_%ld.png", */
+                /*              i, isl_i, dt.tv_sec); */
+                /*     decompress_island_to_png( */
+                /*         dfn, */
+                /*         &islands[isl_i], */
+                /*         g.padded_w, */
+                /*         pal2, */
+                /*         mask2 */
+                /*         ); */
+                /* } */
 
                 // Здесь мы заканчиваем работу с палитрой и ее можно освободить
                 free(palette);
                 free(counts);
-                free(mask2);
+                /* free(mask2); */
 
                 /* */
             }
