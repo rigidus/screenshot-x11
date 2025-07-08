@@ -935,9 +935,9 @@ static void *worker_thread(void *arg)
             // Ничего не выделяет, что следовало бы освободить.
             quantize_and_analyze(s);
 
-            debug_dump_quant(i, s->quant, g.padded_w);
+            /* debug_dump_quant(i, s->quant, g.padded_w); */
 
-            debug_dump_filled(i, s);
+            /* debug_dump_filled(i, s); */
 
             // build per-block color flags: MIXED if fg xor bg != 0
             int bc = g.block_rows * g.block_cols;
@@ -954,40 +954,6 @@ static void *worker_thread(void *arg)
             free(regions);
             free(block_color);
 
-
-/*             // === Найти "острова" MIXED-блоков */
-/*             // Принимает: s->color - блоки: uniform-цвет или MIXED (0xFF) */
-/*             // Возвращает: */
-/*             //    *islands,    // Массив "островов" */
-/*             //    island_n,    // Количество найденных "островов" */
-/*             // Выделяет: */
-/*             //    *islands */
-/*             int island_n; */
-/*             Island *islands = detect_mixed_islands(s->color, g.block_rows, g.block_cols, &island_n); */
-
-/*             for (int i = 0; i < island_n; ++i) { */
-/*                 compute_island_bbox(&islands[i]); */
-/*             } */
-
-/*             /\* islands = merge_islands(islands, &island_n); *\/ */
-/*             for (int i = 0; i < island_n; ++i) { */
-/*                 classify_island(&islands[i], s->quant); */
-/*             } */
-
-
-/*             //  Debug dump islands */
-/*             debug_dump_islands(i, */
-/*                                s->quant,     // квантованный кадр */
-/*                                s->color,     // цветовые метки блоков */
-/*                                islands, */
-/*                                island_n); */
-
-
-            /* // Теперь очищаем все blocks и сам массив islands */
-            /* for (int isl_i = 0; isl_i < island_n; ++isl_i) { */
-            /*     free(islands[isl_i].blocks); */
-            /* } */
-            /* free(islands); */
 
             // Ставим слот в готовое состояние
             atomic_store_explicit(&s->st, QUANT_DONE, memory_order_release);
