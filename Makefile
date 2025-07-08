@@ -1,4 +1,4 @@
-CC     := gcc -DXCAP_DEBUG_QUANT -DXCAP_DEBUG_RAW -DXCAP_DEBUG_FILL -DXCAP_DEBUG_ISLANDS -DXCAP_DEBUG_ALL_ISLANDS
+CC     := gcc
 CFLAGS := -O3 -std=c11 -Wall -Wextra -pedantic
 LIBPNG := -lpng
 XLIBS  := -lX11 -lXext          # нужны только для capture, можно оставить
@@ -47,6 +47,6 @@ clean:
 	rm dbg_*
 
 dbg:
-	XCAP_DEBUG=1 XCAP_DEBUG_RAW=1 XCAP_DEBUG_QUANT=1 XCAP_DEBUG_FILL=1 XCAP_DEBUG_ISLANDS=1 XCAP_DEBUG_CLASSIFY=1 XCAP_DEBUG_COMPRESS=1 XCAP_DEBUG_DECOMPRESS=1 XCAP_DEBUG_ALL_ISLANDS=1 ./xcape_pipe --slots=1
+	./xcape_pipe --slots=1
 
 .PHONY: all clean
