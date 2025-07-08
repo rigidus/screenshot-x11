@@ -64,7 +64,13 @@
 #define MAX(a,b) ((a) > (b) ? (a) : (b))
 #endif
 
+#define MIXED         0xFF             // маркер «mixed»-блока
 #define BS 32
+#define TEMPLATE_SIZE 16            // template width/height in pixels
+#define TEMPLATE_PIXELS (TEMPLATE_SIZE * TEMPLATE_SIZE)
+#define TEMPLATE_BYTES ((TEMPLATE_PIXELS + 7) / 8)  // bytes per binary mask
+#define MATCH_THRESHOLD 0.75f       // required match score for recognition
+#define MAX_REGIONS 1024            // maximum number of detected regions
 #define DEFAULT_SLOTS 4
 #define MAX_SLOTS     8
 #define COLOR_MIXED   0xFFFF
@@ -139,22 +145,21 @@ typedef struct {
 } Region;
 
 
+// Template for a character
+typedef struct {
+    char ch;
+    uint8_t mask[TEMPLATE_BYTES];  // bitmask of TEMPLATE_SIZE×TEMPLATE_SIZE
+} Template;
 
-// Описывает один «остров» смешанных блоков
-// Island structure to hold block indices and metadata
-typedef struct Island {
-    int *blocks;        // dynamic array of block indices (32×32 blocks)
-    int count;          // number of blocks
-    int cap;            // capacity of blocks array
 
-    // bounding box in pixel coordinates
-    int minx, miny, maxx, maxy;
-
-    // classification results
-    uint8_t bg_color;   // most frequent palette color (background)
-    uint8_t fg_color;   // second most frequent (foreground/text)
-    int total_pixels;   // total pixels in the island (count × BS²)
-} Island;
+/* extern int      n_templates; */
+/* extern Template templates[];      // defined elsewhere, size n_templates */
+Template templates[] = {
+    // {'A', { /* 16×16 битовая маска для 'A' */ }},
+    // {'B', { /* ... */ }},
+    // и т.д. для всех нужных символов
+};
+int n_templates = sizeof(templates) / sizeof(templates[0]);
 
 
 /* ---------- объявления -------------------------------------------------- */
@@ -162,11 +167,6 @@ static void allocate_bigmem(void);
 static void init_x11(void);
 static void *capture_thread(void*);
 static void dump_png_rgb(const char *fname, int W, int H, const uint8_t *rgb);
-void decompress_island_to_png(const char *fname,
-                              const Island *isl,
-                              int padded_w,
-                              uint8_t palette[2],
-                              const uint8_t *mask);
 static void *worker_thread(void*);
 static void *serializer_thread(void*);
 
@@ -282,8 +282,6 @@ static void init_x11(void)
 
 
 /* ═════════════════════════ SIMD RGB888→RGB332 ═════════════════════════════ */
-
-#define MIXED         0xFF
 
 
 // Расширение 2-бит → 8-бит
@@ -480,77 +478,70 @@ Region* detect_regions(const uint8_t *mask,
                        const uint8_t *block_color,
                        int block_rows, int block_cols,
                        int *out_region_n) {
-    int block_count = block_rows * block_cols;
-    int mask_bytes  = (BS * BS + 7) / 8;
-    int total_pix   = block_count * BS * BS;
-    bool *visited   = calloc(total_pix, sizeof(bool));
-    Pixel *queue    = malloc(total_pix * sizeof(Pixel));
+    int mask_bytes = (BS * BS + 7) / 8;
+    int total_pix  = block_rows * block_cols * BS * BS;
+    bool *visited  = calloc(total_pix, sizeof(bool));
+    Pixel *queue   = malloc(total_pix * sizeof(Pixel));
 
     Region *regions = NULL;
     int region_n = 0, region_cap = 0;
 
-    for (int by = 0; by < block_rows; ++by) {
-        for (int bx = 0; bx < block_cols; ++bx) {
+    for (int by = 0; by < block_rows; ++by) for (int bx = 0; bx < block_cols; ++bx) {
             int bidx = by * block_cols + bx;
             if (block_color[bidx] != MIXED) continue;
             const uint8_t *mask_block = mask + bidx * mask_bytes;
-
-            for (int dy = 0; dy < BS; ++dy) {
-                for (int dx = 0; dx < BS; ++dx) {
+            for (int dy = 0; dy < BS; ++dy) for (int dx = 0; dx < BS; ++dx) {
                     int bit   = dy * BS + dx;
-                    if (!(mask_block[bit >> 3] & (1 << (bit & 7)))) continue;
+                    if (!(mask_block[bit>>3] & (1 << (bit&7)))) continue;
                     int local = (bidx * BS + dy) * BS + dx;
                     if (visited[local]) continue;
 
-                    // init BFS queue
+                    // start BFS
                     int qh = 0, qt = 0;
-                    queue[qt++] = (Pixel){by, bx, (uint8_t)dy, (uint8_t)dx};
+                    queue[qt++] = (Pixel){by,(uint16_t)bx,(uint8_t)dy,(uint8_t)dx};
                     visited[local] = true;
 
-                    // allocate new region
                     if (region_n == region_cap) {
-                        region_cap = region_cap ? region_cap * 2 : 8;
+                        region_cap = region_cap ? region_cap*2 : 8;
                         regions = realloc(regions, region_cap * sizeof(Region));
                     }
                     Region *reg = &regions[region_n++];
                     reg->count  = 0;
                     reg->pixels = NULL;
-                    int gx0 = bx * BS + dx;
-                    int gy0 = by * BS + dy;
+                    int gx0 = bx*BS + dx;
+                    int gy0 = by*BS + dy;
                     reg->minx = reg->maxx = gx0;
                     reg->miny = reg->maxy = gy0;
 
-                    // BFS flood
                     const int d4[4][2] = {{-1,0},{1,0},{0,-1},{0,1}};
                     while (qh < qt) {
                         Pixel p = queue[qh++];
                         // append pixel
-                        reg->pixels = realloc(reg->pixels, (reg->count+1)*sizeof(Pixel));
+                        reg->pixels = realloc(reg->pixels, (reg->count+1) * sizeof(Pixel));
                         reg->pixels[reg->count++] = p;
-                        // update bounding box
-                        int gx = p.bx * BS + p.dx;
-                        int gy = p.by * BS + p.dy;
+                        // update bbox
+                        int gx = p.bx*BS + p.dx;
+                        int gy = p.by*BS + p.dy;
                         if (gx < reg->minx) reg->minx = gx;
                         if (gx > reg->maxx) reg->maxx = gx;
                         if (gy < reg->miny) reg->miny = gy;
                         if (gy > reg->maxy) reg->maxy = gy;
-
+                        // neighbors
                         for (int k = 0; k < 4; ++k) {
                             int ndy = p.dy + d4[k][0];
                             int ndx = p.dx + d4[k][1];
-                            int nby = p.by;
-                            int nbx = p.bx;
-                            if (ndy < 0)      { nby = p.by - 1; ndy = BS - 1; }
-                            else if (ndy >= BS) { nby = p.by + 1; ndy = 0;    }
-                            if (ndx < 0)      { nbx = p.bx - 1; ndx = BS - 1; }
-                            else if (ndx >= BS) { nbx = p.bx + 1; ndx = 0;    }
-                            if (nby < 0 || nby >= block_rows ||
-                                nbx < 0 || nbx >= block_cols) continue;
+                            int nby = p.by, nbx = p.bx;
+                            if      (ndy < 0)      { nby = p.by - 1; ndy = BS - 1; }
+                            else if (ndy >= BS)    { nby = p.by + 1; ndy = 0;    }
+                            if      (ndx < 0)      { nbx = p.bx - 1; ndx = BS - 1; }
+                            else if (ndx >= BS)    { nbx = p.bx + 1; ndx = 0;    }
+                            if (nby < 0 || nby >= block_rows || nbx < 0 || nbx >= block_cols)
+                                continue;
                             int nbidx = nby * block_cols + nbx;
                             if (block_color[nbidx] != MIXED) continue;
                             const uint8_t *nb_mask = mask + nbidx * mask_bytes;
                             int nbit = ndy * BS + ndx;
-                            if (!(nb_mask[nbit >> 3] & (1 << (nbit & 7)))) continue;
+                            if (!(nb_mask[nbit>>3] & (1 << (nbit&7)))) continue;
                             int nl = (nbidx * BS + ndy) * BS + ndx;
                             if (visited[nl]) continue;
                             visited[nl] = true;
@@ -558,15 +549,15 @@ Region* detect_regions(const uint8_t *mask,
                         }
                     }
                 }
-            }
         }
-    }
 
     free(queue);
     free(visited);
     *out_region_n = region_n;
     return regions;
 }
+
+
 
 /* ═════════════════════════ потоки ════════════════════════════════════════ */
 
@@ -902,15 +893,58 @@ void debug_dump_regions(int slot_idx,
 
 
 
-/**
- *  Check if two bounding boxes intersect or touch
- */
-static inline bool bbox_intersect(const Island *a, const Island *b) {
-    return !(a->maxx < b->minx
-             || b->maxx < a->minx
-             || a->maxy < b->miny
-             || b->maxy < a->miny);
+// Render region into 16×16 sample mask
+void render_region(const Region *reg, uint8_t *sample) {
+    memset(sample, 0, TEMPLATE_BYTES);
+    for (int i = 0; i < reg->count; ++i) {
+        Pixel p = reg->pixels[i];
+        int gx = p.bx*BS + p.dx;
+        int gy = p.by*BS + p.dy;
+        int rx = gx - reg->minx;
+        int ry = gy - reg->miny;
+        if (rx < TEMPLATE_SIZE && ry < TEMPLATE_SIZE) {
+            int bit = ry * TEMPLATE_SIZE + rx;
+            sample[bit>>3] |= 1 << (bit & 7);
+        }
+    }
 }
+
+// Popcount of 8-bit mask
+static inline int popcount8(uint8_t v) { return __builtin_popcount(v); }
+
+// Recognize single region by template matching
+char recognize_region(const Region *reg) {
+    uint8_t sample[TEMPLATE_BYTES];
+    render_region(reg, sample);
+    float best_score = 0.0f;
+    char  best_ch    = '?';
+
+    for (int t = 0; t < n_templates; ++t) {
+        int match = 0;
+        for (int i = 0; i < TEMPLATE_BYTES; ++i) {
+            uint8_t xnor = ~(sample[i] ^ templates[t].mask[i]);
+            match += popcount8(xnor);
+        }
+        float score = (float)match / TEMPLATE_PIXELS;
+        if (score > best_score) {
+            best_score = score;
+            best_ch    = templates[t].ch;
+        }
+    }
+    return best_score >= MATCH_THRESHOLD ? best_ch : '?';
+}
+
+
+// Debug: dump recognized letters
+void debug_recognize(int slot_idx,
+                     Region *regions, int region_n) {
+    for (int r = 0; r < region_n; ++r) {
+        char c = recognize_region(&regions[r]);
+        printf("slot %d, region %d: '%c'\n", slot_idx, r, c);
+    }
+}
+
+
 
 static void *worker_thread(void *arg)
 {
@@ -950,7 +984,15 @@ static void *worker_thread(void *arg)
                                              g.block_rows, g.block_cols,
                                              &region_n);
             debug_dump_regions(i, regions, region_n);
-            for (int r = 0; r < region_n; ++r) free(regions[r].pixels);
+            /* for (int r = 0; r < region_n; ++r) free(regions[r].pixels); */
+            /* free(regions); */
+            /* free(block_color); */
+
+
+            debug_recognize(i, regions, region_n);
+
+            for (int r = 0; r < region_n; ++r)
+                free(regions[r].pixels);
             free(regions);
             free(block_color);
 
