@@ -1205,7 +1205,6 @@ void decompress_island_to_png(
 }
 
 
-#ifdef XCAP_DEBUG_RAW
 // Debug: dump raw BGRA→RGB buffer as PNG
 static void debug_dump_raw(int slot,
                            const uint8_t *raw_bgra,
@@ -1228,10 +1227,10 @@ static void debug_dump_raw(int slot,
     dump_png_rgb(fn, w, h, rgb);
     free(rgb);
 }
-#endif
 
 
-#ifdef XCAP_DEBUG_QUANT
+
+
 // Debug: dump quantized RGB332 buffer as RGB888 PNG
 static void debug_dump_quant(int slot, const uint8_t *quant,int padded_w) {
     uint8_t *rgb = malloc((size_t)g.w * g.h * 3);
@@ -1255,10 +1254,6 @@ static void debug_dump_quant(int slot, const uint8_t *quant,int padded_w) {
     dump_png_rgb(fn, g.w, g.h, rgb);
     free(rgb);
 }
-#endif
-
-
-#ifdef XCAP_DEBUG_FILL
 
 // Рисует отладочное изображение, где каждый 32×32-блок:
 //  - uniform (mask all zero): заливают bg, рисуют белые/чёрные рамки и диагонали,
@@ -1390,7 +1385,6 @@ static void debug_dump_filled(int slot_idx, const FrameSlot *slot) {
     dump_filled_blocks_png(fname, slot);
 }
 
-#endif
 
 
 /** вычисляет пиксельный bounding box для острова,
@@ -1519,7 +1513,6 @@ static void classify_island(Island *isl, const uint8_t *quant) {
 }
 
 
-#ifdef XCAP_DEBUG_ISLANDS
 
 static void dump_islands_png(const char *fname,
                              const uint8_t *quant,
@@ -1687,7 +1680,6 @@ static void debug_dump_islands(int slot,
                      islands,
                      island_n);
 }
-#endif
 
 
 static void *worker_thread(void *arg)
@@ -1703,9 +1695,7 @@ static void *worker_thread(void *arg)
             if (!atomic_compare_exchange_strong(&s->st, &exp, IN_PROGRESS))
                 continue;
 
-#ifdef XCAP_DEBUG_RAW
-            debug_dump_raw(i, s->raw, g.w, g.h);
-#endif
+            /* debug_dump_raw(i, s->raw, g.w, g.h); */
 
             // === Квантование RGB332 + анализ uniform-блоков 32×32
             // Принимает: s->raw - RGBA8888
@@ -1715,14 +1705,9 @@ static void *worker_thread(void *arg)
             // Ничего не выделяет, что следовало бы освободить.
             quantize_and_analyze(s);
 
-#ifdef XCAP_DEBUG_QUANT
             debug_dump_quant(i, s->quant, g.padded_w);
-#endif
 
-
-#ifdef XCAP_DEBUG_FILL
             debug_dump_filled(i, s);
-#endif
 
 /*             // === Найти "острова" MIXED-блоков */
 /*             // Принимает: s->color - блоки 8×8: uniform-цвет или MIXED (0xFF) */
@@ -1745,13 +1730,11 @@ static void *worker_thread(void *arg)
 
 
 /*             //  Debug dump islands */
-/* #ifdef XCAP_DEBUG_ISLANDS */
 /*             debug_dump_islands(i, */
 /*                                s->quant,     // квантованный кадр */
 /*                                s->color,     // цветовые метки блоков */
 /*                                islands, */
 /*                                island_n); */
-/* #endif */
 
 
             /* // Теперь очищаем все blocks и сам массив islands */
