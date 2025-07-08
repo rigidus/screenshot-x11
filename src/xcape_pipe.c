@@ -53,6 +53,7 @@
 #include <unistd.h>
 #include <stdbool.h>
 #include <math.h>
+#include <limits.h>
 
 
 /* ---------- константы и вспомогалки ------------------------------------ */
@@ -66,6 +67,10 @@
 
 #define MIXED         0xFF             // маркер «mixed»-блока
 #define BS 32
+#define MAX_NEIGHBOR_GAP 32  // максимально допустимый gap по X между буквами
+#define MAX_HEIGHT_DIFF      6     // максимально допустимая разница высот
+#define MAX_VERTICAL_OFFSET  (BS/2) // отклонение по центру
+
 #define TEMPLATE_SIZE 16            // template width/height in pixels
 #define TEMPLATE_PIXELS (TEMPLATE_SIZE * TEMPLATE_SIZE)
 #define TEMPLATE_BYTES ((TEMPLATE_PIXELS + 7) / 8)  // bytes per binary mask
@@ -138,11 +143,22 @@ typedef struct {
     uint8_t  dy, dx;  // pixel offsets inside block
 } Pixel;
 
-typedef struct {
+
+typedef struct Region {
     int minx, miny, maxx, maxy;  // bounding box in global pixels
     int count;                   // number of pixels in region
     Pixel *pixels;               // array of Pixel
+    struct Region *neighbor;     // next region on the right, or NULL
 } Region;
+
+
+// Новая структура для групп строк
+typedef struct {
+    Region **regions;  // указатели на регионы в этой строке
+    int      count;    // сколько регионов в строке
+    // computed bbox:
+    int minx, miny, maxx, maxy;
+} Line;
 
 
 // Template for a character
@@ -946,6 +962,301 @@ void debug_recognize(int slot_idx,
 
 
 
+
+// Функция группировки Region в строки по вертикали
+static int cmp_region_miny(const void *a, const void *b) {
+    const Region *r1 = *(Region**)a;
+    const Region *r2 = *(Region**)b;
+    return r1->miny - r2->miny;
+}
+
+static int cmp_region_minx(const void *a, const void *b) {
+    const Region *r1 = *(Region**)a;
+    const Region *r2 = *(Region**)b;
+    return r1->minx - r2->minx;
+}
+
+void group_regions(Region *regions, int region_n,
+                   Line **out_lines, int *out_line_n) {
+    if (region_n == 0) { *out_lines = NULL; *out_line_n = 0; return; }
+
+    // Собираем массив указателей и сортируем по miny
+    Region **arr = malloc(region_n * sizeof(Region*));
+    for (int i = 0; i < region_n; i++) arr[i] = &regions[i];
+    qsort(arr, region_n, sizeof(Region*), cmp_region_miny);
+
+    // Средняя высота региона
+    float avg_h = 0;
+    for (int i = 0; i < region_n; i++)
+        avg_h += (arr[i]->maxy - arr[i]->miny + 1);
+    avg_h /= region_n;
+
+    const float GAP = avg_h * 0.6f;
+
+    Line *lines = NULL;
+    int   line_n = 0;
+
+    // Кластеризуем жадно
+    for (int i = 0; i < region_n; i++) {
+        Region *r = arr[i];
+        if (line_n == 0) {
+            lines = realloc(lines, sizeof(Line) * (line_n+1));
+            lines[line_n].regions = malloc(sizeof(Region*));
+            lines[line_n].regions[0] = r;
+            lines[line_n].count = 1;
+            line_n++;
+        } else {
+            Line *L = &lines[line_n-1];
+            // вычисляем текущий maxy в последней строке
+            int maxy = L->miny = L->maxy = L->regions[0]->miny;
+            for (int j = 0; j < L->count; j++) {
+                if (L->regions[j]->maxy > maxy) maxy = L->regions[j]->maxy;
+                if (j==0) L->miny = L->regions[j]->miny;
+                else if (L->regions[j]->miny < L->miny) L->miny = L->regions[j]->miny;
+            }
+            // если r лежит по-вертикали близко — добавляем в эту строку
+            if (r->miny <= maxy + GAP) {
+                L->regions = realloc(L->regions, sizeof(Region*)*(L->count+1));
+                L->regions[L->count++] = r;
+            } else {
+                // новая строка
+                lines = realloc(lines, sizeof(Line) * (line_n+1));
+                lines[line_n].regions = malloc(sizeof(Region*));
+                lines[line_n].regions[0] = r;
+                lines[line_n].count = 1;
+                line_n++;
+            }
+        }
+    }
+
+    // внутри каждой строки сортируем по X и вычисляем bbox
+    for (int i = 0; i < line_n; i++) {
+        Line *L = &lines[i];
+        qsort(L->regions, L->count, sizeof(Region*), cmp_region_minx);
+        // init bbox
+        L->minx = L->regions[0]->minx;
+        L->maxx = L->regions[0]->maxx;
+        L->miny = L->regions[0]->miny;
+        L->maxy = L->regions[0]->maxy;
+        for (int j = 1; j < L->count; j++) {
+            Region *r = L->regions[j];
+            if (r->minx < L->minx) L->minx = r->minx;
+            if (r->miny < L->miny) L->miny = r->miny;
+            if (r->maxx > L->maxx) L->maxx = r->maxx;
+            if (r->maxy > L->maxy) L->maxy = r->maxy;
+        }
+    }
+
+    free(arr);
+    *out_lines  = lines;
+    *out_line_n = line_n;
+}
+
+
+// Отладочный дамп строк: рисуем bbox каждой строки цветной рамкой
+void debug_dump_lines(int slot_idx, Line *lines, int line_n) {
+    uint8_t *rgb = malloc((size_t)g.w * g.h * 3);
+    memset(rgb, 255, (size_t)g.w * g.h * 3);
+
+    srand(slot_idx);
+    for (int i = 0; i < line_n; i++) {
+        Line *L = &lines[i];
+        uint8_t rr = rand() & 255;
+        uint8_t gg = rand() & 255;
+        uint8_t bb = rand() & 255;
+        // по периметру bbox
+        for (int x = L->minx; x <= L->maxx; x++) {
+            size_t t = ((size_t)L->miny * g.w + x)*3;
+            size_t b = ((size_t)L->maxy * g.w + x)*3;
+            rgb[t+0]=rr; rgb[t+1]=gg; rgb[t+2]=bb;
+            rgb[b+0]=rr; rgb[b+1]=gg; rgb[b+2]=bb;
+        }
+        for (int y = L->miny; y <= L->maxy; y++) {
+            size_t l = ((size_t)y * g.w + L->minx)*3;
+            size_t r = ((size_t)y * g.w + L->maxx)*3;
+            rgb[l+0]=rr; rgb[l+1]=gg; rgb[l+2]=bb;
+            rgb[r+0]=rr; rgb[r+1]=gg; rgb[r+2]=bb;
+        }
+    }
+
+    char fn[64];
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    snprintf(fn, sizeof(fn), "lines_%d_%ld.png", slot_idx, ts.tv_sec);
+    dump_png_rgb(fn, g.w, g.h, rgb);
+    free(rgb);
+}
+
+// =============================================================================
+/* // Для каждого маленького региона (<32×32) найдем «соседа» справа */
+/* static void set_region_neighbors(Region *regions, int region_n) { */
+/*     // Сбросим все указатели */
+/*     for (int i = 0; i < region_n; i++) { */
+/*         regions[i].neighbor = NULL; */
+/*     } */
+/*     // Для каждого маленького региона найдём «соседа» справа */
+/*     for (int i = 0; i < region_n; i++) { */
+/*         Region *ri = &regions[i]; */
+/*         int wi = ri->maxx - ri->minx + 1; */
+/*         int hi = ri->maxy - ri->miny + 1; */
+/*         // интересуют только регионы меньше 32×32 */
+/*         if (wi >= 32 || hi >= 32) continue; */
+
+/*         int best_dx = INT_MAX; */
+/*         int best_j  = -1; */
+/*         int cy_i    = (ri->miny + ri->maxy) / 2; */
+
+/*         for (int j = 0; j < region_n; j++) { */
+/*             if (i == j) continue; */
+/*             Region *rj = &regions[j]; */
+/*             int wj = rj->maxx - rj->minx + 1; */
+/*             int hj = rj->maxy - rj->miny + 1; */
+/*             if (wj >= 32 || hj >= 32) continue; */
+
+/*             int dx = rj->minx - ri->maxx; */
+/*             // справа, в пределах MAX_NEIGHBOR_GAP и лучше по dx */
+/*             if (dx <= 0 || dx > MAX_NEIGHBOR_GAP || dx >= best_dx) continue; */
+
+/*             // похож по размерам */
+/*             if (abs(wj - wi) > 4) continue; */
+
+/*             // похож по вертикальному положению */
+/*             int cy_j = (rj->miny + rj->maxy) / 2; */
+/*             if (abs(cy_j - cy_i) > BS/4) continue; */
+
+/*             best_dx = dx; */
+/*             best_j  = j; */
+/*         } */
+
+/*         if (best_j >= 0) { */
+/*             ri->neighbor = &regions[best_j]; */
+/*         } */
+/*     } */
+/* } */
+
+static void set_region_neighbors(Region *regions, int region_n) {
+    // Сброс всех ссылок
+    for (int i = 0; i < region_n; i++) {
+        regions[i].neighbor = NULL;
+    }
+
+    for (int i = 0; i < region_n; i++) {
+        Region *ri = &regions[i];
+        int wi = ri->maxx - ri->minx + 1;
+        int hi = ri->maxy - ri->miny + 1;
+        // только «маленькие» регионы
+        if (wi >= BS || hi >= BS) continue;
+
+        int best_dx = INT_MAX, best_j = -1;
+        int cy_i    = (ri->miny + ri->maxy) / 2;
+
+        for (int j = 0; j < region_n; j++) {
+            if (i == j) continue;
+            Region *rj = &regions[j];
+            int wj = rj->maxx - rj->minx + 1;
+            int hj = rj->maxy - rj->miny + 1;
+            if (wj >= BS || hj >= BS) continue;
+
+            int dx = rj->minx - ri->maxx;
+            // справа, не дальше, чем MAX_NEIGHBOR_GAP, и лучше, чем предыдущий
+            if (dx <= 0 || dx > MAX_NEIGHBOR_GAP || dx >= best_dx) continue;
+
+            // **правильно**: сравниваем по высоте, а не по ширине
+            if (abs(hj - hi) > MAX_HEIGHT_DIFF) continue;
+
+            int cy_j = (rj->miny + rj->maxy) / 2;
+            if (abs(cy_j - cy_i) > MAX_VERTICAL_OFFSET) continue;
+
+            best_dx = dx;
+            best_j  = j;
+        }
+
+        if (best_j >= 0) {
+            ri->neighbor = &regions[best_j];
+        }
+    }
+}
+
+
+// Debug: рисуем сначала рамки всех маленьких регионов, затем по «цепочкам» общие bbox строк
+static void debug_dump_chains(int slot_idx, Region *regions, int region_n) {
+    uint8_t *rgb = malloc((size_t)g.w * g.h * 3);
+    memset(rgb, 255, (size_t)g.w * g.h * 3);
+
+    // 1) Рисуем чёрные рамки вокруг каждого маленького региона
+    for (int i = 0; i < region_n; i++) {
+        Region *r = &regions[i];
+        int w = r->maxx - r->minx + 1;
+        int h = r->maxy - r->miny + 1;
+        if (w < 32 && h < 32) {
+            for (int x = r->minx; x <= r->maxx; x++) {
+                size_t t = ((size_t)r->miny * g.w + x)*3;
+                size_t b = ((size_t)r->maxy * g.w + x)*3;
+                rgb[t+0] = rgb[t+1] = rgb[t+2] = 0;
+                rgb[b+0] = rgb[b+1] = rgb[b+2] = 0;
+            }
+            for (int y = r->miny; y <= r->maxy; y++) {
+                size_t l = ((size_t)y * g.w + r->minx)*3;
+                size_t rr= ((size_t)y * g.w + r->maxx)*3;
+                rgb[l+0] = rgb[l+1] = rgb[l+2] = 0;
+                rgb[rr+0]= rgb[rr+1]= rgb[rr+2]= 0;
+            }
+        }
+    }
+
+    // 2) Помечаем все регионы, на которые кто-то ссылается как на neighbor
+    bool *is_target = calloc(region_n, sizeof(bool));
+    for (int i = 0; i < region_n; i++) {
+        Region *nbr = regions[i].neighbor;
+        if (nbr) {
+            int idx = (int)(nbr - regions);
+            if (idx >= 0 && idx < region_n) {
+                is_target[idx] = true;
+            }
+        }
+    }
+
+        // 3) Для каждого «головы» цепочки (не является target, но имеет neighbor) —
+        //    проходим по цепочке и рисуем красную рамку вокруг общего bbox
+    srand(slot_idx + 123);
+    for (int i = 0; i < region_n; i++) {
+        Region *r0 = &regions[i];
+        if (!is_target[i] && r0->neighbor) {
+            int minx = r0->minx, miny = r0->miny;
+            int maxx = r0->maxx, maxy = r0->maxy;
+            // обходим цепочку
+            for (Region *cur = r0; cur; cur = cur->neighbor) {
+                if (cur->minx < minx) minx = cur->minx;
+                if (cur->miny < miny) miny = cur->miny;
+                if (cur->maxx > maxx) maxx = cur->maxx;
+                if (cur->maxy > maxy) maxy = cur->maxy;
+            }
+
+            // рисуем красную рамку для всей строки
+            for (int x = minx; x <= maxx; x++) {
+                size_t t = ((size_t)miny * g.w + x)*3;
+                size_t b = ((size_t)maxy * g.w + x)*3;
+                rgb[t+0] = 255; rgb[t+1] =   0; rgb[t+2] =   0;
+                rgb[b+0] = 255; rgb[b+1] =   0; rgb[b+2] =   0;
+            }
+            for (int y = miny; y <= maxy; y++) {
+                size_t l = ((size_t)y * g.w + minx)*3;
+                size_t rr= ((size_t)y * g.w + maxx)*3;
+                rgb[l+0] = 255; rgb[l+1] =   0; rgb[l+2] =   0;
+                rgb[rr+0]= 255; rgb[rr+1]=   0; rgb[rr+2]=   0;
+            }
+        }
+    }
+    free(is_target);
+
+    // 4) Сохраняем
+    char fn[64]; struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    snprintf(fn, sizeof(fn), "chains_%d_%ld.png", slot_idx, ts.tv_sec);
+    dump_png_rgb(fn, g.w, g.h, rgb);
+    free(rgb);
+}
+
 static void *worker_thread(void *arg)
 {
     /* uintptr_t wid = (uintptr_t)arg; */
@@ -983,13 +1294,39 @@ static void *worker_thread(void *arg)
             Region *regions = detect_regions(s->mask, block_color,
                                              g.block_rows, g.block_cols,
                                              &region_n);
+
+            // ——— Отфильтруем слишком большие регионы (>32×32) ———
+            int small_n = 0;
+            Region *small = malloc(region_n * sizeof(Region));
+            for (int r = 0; r < region_n; r++) {
+                int w = regions[r].maxx - regions[r].minx + 1;
+                int h = regions[r].maxy - regions[r].miny + 1;
+                if (w <= 32 && h <= 32) {
+                    // оставляем этот регион
+                    small[small_n++] = regions[r];
+                } else {
+                    // слишком большой — сразу освобождаем его пиксели
+                    free(regions[r].pixels);
+                }
+            }
+            free(regions);
+            regions    = small;
+            region_n   = small_n;
+            // ——————————————————————————————————————————————————————————
+
             debug_dump_regions(i, regions, region_n);
+
             /* for (int r = 0; r < region_n; ++r) free(regions[r].pixels); */
             /* free(regions); */
             /* free(block_color); */
 
-
             debug_recognize(i, regions, region_n);
+
+
+            // связываем «соседей» и рисуем цепочки
+            set_region_neighbors(regions, region_n);
+            debug_dump_chains(i, regions, region_n);
+
 
             for (int r = 0; r < region_n; ++r)
                 free(regions[r].pixels);
