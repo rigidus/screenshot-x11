@@ -1,9 +1,27 @@
 CC     := gcc
-CFLAGS := -O3 -std=c11 -Wall -Wextra -pedantic
+CFLAGS := -O3 -std=c17 -Wall -Wextra -pedantic
 LIBPNG := -lpng
-XLIBS  := -lX11 -lXext          # нужны только для capture, можно оставить
+
+# Определение платформы
+ifeq ($(OS),Windows_NT)
+    PLATFORM := windows
+    PLATFORM_LIBS := -lgdi32 -luser32 -lkernel32
+    XLIBS := 
+    EXE_SUFFIX := .exe
+    PLATFORM_DEF := -DPLATFORM_WINDOWS
+else
+    UNAME_S := $(shell uname -s)
+    ifeq ($(UNAME_S),Linux)
+        PLATFORM := linux
+        PLATFORM_LIBS := -lX11 -lXext -lnuma -lpthread
+        XLIBS := -lX11 -lXext
+        EXE_SUFFIX := 
+        PLATFORM_DEF := -DPLATFORM_LINUX
+    endif
+endif
 
 SRC    := src
+XCAPE_SRC := xcape_pipe
 BIN    := capture invert linefinder rectfinder rectfinder2 cclfinder cclfinder16 rectfinder_top15 xcape_pipe viewer
 
 CXX ?= g++
@@ -12,34 +30,43 @@ OPENCV_CFLAGS := $(shell pkg-config --cflags opencv4)
 OPENCV_LIBS   := $(shell pkg-config --libs   opencv4)
 
 capture:   $(SRC)/capture.c
-	$(CC) $(CFLAGS) $< -o $@ $(XLIBS) $(LIBPNG)
+	$(CC) $(CFLAGS) $< -o $@$(EXE_SUFFIX) $(XLIBS) $(LIBPNG)
 
 invert:    $(SRC)/invert.c
-	$(CC) $(CFLAGS) $< -o $@ $(LIBPNG)
+	$(CC) $(CFLAGS) $< -o $@$(EXE_SUFFIX) $(LIBPNG)
 
 linefinder: $(SRC)/linefinder.c
-	$(CC) $(CFLAGS) $< -o $@ $(LIBPNG)
+	$(CC) $(CFLAGS) $< -o $@$(EXE_SUFFIX) $(LIBPNG)
 
 rectfinder: src/rectfinder.c
-	$(CC) $(CFLAGS) $< -o $@ $(LIBPNG)
+	$(CC) $(CFLAGS) $< -o $@$(EXE_SUFFIX) $(LIBPNG)
 
 rectfinder2: src/rectfinder2.c
-	$(CC) $(CFLAGS) $< -o $@ $(LIBPNG)
+	$(CC) $(CFLAGS) $< -o $@$(EXE_SUFFIX) $(LIBPNG)
 
 cclfinder: src/cclfinder.cpp
-	$(CXX) $(CFLAGS) $(OPENCV_CFLAGS) $< -o $@ $(OPENCV_LIBS)
+	$(CXX) $(CFLAGS) $(OPENCV_CFLAGS) $< -o $@$(EXE_SUFFIX) $(OPENCV_LIBS)
 
 cclfinder16: src/cclfinder16.cpp
-	$(CXX) $(CFLAGS) $(OPENCV_CFLAGS) $< -o $@ $(OPENCV_LIBS)
+	$(CXX) $(CFLAGS) $(OPENCV_CFLAGS) $< -o $@$(EXE_SUFFIX) $(OPENCV_LIBS)
 
 rectfinder_top15: src/rectfinder_top15.cpp
-	$(CXX) $(CFLAGS) $(OPENCV_CFLAGS) $< -o $@ $(OPENCV_LIBS)
+	$(CXX) $(CFLAGS) $(OPENCV_CFLAGS) $< -o $@$(EXE_SUFFIX) $(OPENCV_LIBS)
 
-xcape_pipe: src/xcape_pipe.c
-	$(CC) -O3 -march=native -std=c17 -Wall -Wextra -pthread $<  -lXext -lX11 -lnuma -lpng -o $@
+# Кроссплатформенная сборка xcape_pipe
+xcape_pipe: $(XCAPE_SRC)/xcape_pipe.c $(XCAPE_SRC)/processing.c $(XCAPE_SRC)/debug.c $(XCAPE_SRC)/common.h
+ifeq ($(PLATFORM),windows)
+	$(CC) $(CFLAGS) $(PLATFORM_DEF) -mconsole -I$(XCAPE_SRC) \
+		$(XCAPE_SRC)/xcape_pipe.c $(XCAPE_SRC)/processing.c $(XCAPE_SRC)/debug.c $(XCAPE_SRC)/windows.c \
+		$(PLATFORM_LIBS) $(LIBPNG) -o $@$(EXE_SUFFIX)
+else
+	$(CC) $(CFLAGS) $(PLATFORM_DEF) -I$(XCAPE_SRC) -pthread \
+		$(XCAPE_SRC)/xcape_pipe.c $(XCAPE_SRC)/processing.c $(XCAPE_SRC)/debug.c $(XCAPE_SRC)/linux.c \
+		$(PLATFORM_LIBS) $(LIBPNG) -o $@$(EXE_SUFFIX)
+endif
 
 viewer: src/viewer.c
-	gcc -O2 -std=c17 -Wall -Wextra $< -lpng -o $@
+	gcc -O2 -std=c17 -Wall -Wextra $< -lpng -o $@$(EXE_SUFFIX)
 
 clean:
 	rm -f $(BIN) frame_*.png *_*.png
