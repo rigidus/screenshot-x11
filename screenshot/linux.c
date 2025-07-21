@@ -23,7 +23,7 @@ typedef struct {
 /* ========== Linux квантизация ========== */
 
 void platform_quantize_rgba_to_rgb332(const uint8_t *rgba_data, uint8_t *quant_data, 
-                                       int width, int height, int padded_width) {
+                                       int width, int height, int padded_width, int bytes_per_line) {
     // Однократный детект SIMD возможностей
     static bool inited = false;
     static bool use256;
@@ -35,7 +35,7 @@ void platform_quantize_rgba_to_rgb332(const uint8_t *rgba_data, uint8_t *quant_d
 
     // Векторное квантование RGBA → RGB332
     for (int y = 0; y < height; ++y) {
-        const uint8_t *row_src = rgba_data + (size_t)y * width * 4;  // RGBA
+        const uint8_t *row_src = rgba_data + (size_t)y * bytes_per_line;  // Используем bytes_per_line
         uint8_t *row_q = quant_data + (size_t)y * padded_width;
         int x = 0;
 
@@ -227,7 +227,8 @@ bool platform_capture_screen(GlobalContext *ctx, int slot_index) {
     // Прямая квантизация RGBA → RGB332
     platform_quantize_rgba_to_rgb332((uint8_t*)pdata->ximg[slot_index]->data,
                                       ctx->slot[slot_index].quant,
-                                      ctx->w, ctx->h, ctx->padded_w);
+                                      ctx->w, ctx->h, ctx->padded_w, 
+                                      pdata->ximg[slot_index]->bytes_per_line);
 
     return true;
 }

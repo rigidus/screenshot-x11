@@ -190,7 +190,7 @@ bool platform_capture_screen(GlobalContext *ctx, int slot_index);
 void platform_quantize_bgr_to_rgb332(const uint8_t *bgr_data, uint8_t *quant_data, 
                                       int width, int height, int padded_width);
 void platform_quantize_rgba_to_rgb332(const uint8_t *rgba_data, uint8_t *quant_data, 
-                                       int width, int height, int padded_width);
+                                       int width, int height, int padded_width, int bytes_per_line);
 
 // Объявления общих функций обработки
 void allocate_bigmem(GlobalContext *ctx);
