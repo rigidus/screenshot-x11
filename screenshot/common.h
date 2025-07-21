@@ -14,29 +14,59 @@
 #include <emmintrin.h>  // SSE2
 #include <immintrin.h>  // AVX2
 #include <xmmintrin.h>  // SSE
+
+
 /* ========== Определение платформы ========== */
-#ifdef _WIN32
-    #define PLATFORM_WINDOWS
-    #include <windows.h>  // для QueryPerformanceCounter
+
+#if defined(_WIN32)
+    #ifndef PLATFORM_WINDOWS
+        #define PLATFORM_WINDOWS
+    #endif
+    #include <windows.h>    // QueryPerformanceCounter и пр.
+
 #elif defined(__linux__)
-    /* #define PLATFORM_LINUX */
-    #include <numa.h>
+    #ifndef PLATFORM_LINUX
+        #define PLATFORM_LINUX
+    #endif
+    #include <numa.h>       // libnuma
+
+#elif defined(__APPLE__)
+    #ifndef PLATFORM_MACOS
+        #define PLATFORM_MACOS
+    #endif
+
 #else
     #error "Unsupported platform"
 #endif
 
 /* ========== Константы ========== */
+
 #define BS 32
 #define MAX_SLOTS 8
 
+
 /* ========== Пути сохранения скриншотов ========== */
+
+
 #ifndef SCREENSHOT_PATH
-    #ifdef PLATFORM_WINDOWS
+    #ifdef PLATFORM_SHOT_PATH
+        #define SCREENSHOT_PATH PLATFORM_SHOT_PATH
+
+    #elif defined(PLATFORM_WINDOWS) || defined(_WIN32)
         #define SCREENSHOT_PATH "C:\\Tmp\\"
-    #else
+
+    #elif defined(PLATFORM_LINUX)   || defined(__linux__)
         #define SCREENSHOT_PATH "/tmp/"
-    #endif
-#endif
+
+    #elif defined(PLATFORM_MACOS)   || defined(__APPLE__)
+        #define SCREENSHOT_PATH "/Users/Shared/tmp/"
+
+    #else
+        #define SCREENSHOT_PATH "./"
+    #endif  /* PLATFORM_SHOT_PATH / PLATFORM_* */
+
+#endif  /* SCREENSHOT_PATH */
+
 
 // Максимальная длина полного пути к файлу
 #define MAX_SCREENSHOT_PATH 512
@@ -64,8 +94,11 @@
 #define MAX(a,b) ((a) > (b) ? (a) : (b))
 #endif
 
+
 /* ========== Общие типы ========== */
+
 enum slot_state { FREE, RAW_READY, IN_PROGRESS, QUANT_DONE, SERIALIZING };
+
 
 typedef struct {
     _Atomic enum slot_state st;
@@ -77,6 +110,7 @@ typedef struct {
     uint8_t  *mask;        // битовая маска блоков
     int       block_count; // число блоков
 } FrameSlot;
+
 
 typedef struct {
     /* исходное разрешение экрана */
@@ -105,10 +139,12 @@ typedef struct {
     void *platform_data;
 } GlobalContext;
 
+
 typedef struct {
     uint16_t by, bx;  // block indices
     uint8_t  dy, dx;  // pixel offsets inside block
 } Pixel;
+
 
 typedef struct OcrRegion {
     int minx, miny, maxx, maxy;  // bounding box in global pixels
@@ -117,20 +153,25 @@ typedef struct OcrRegion {
     struct OcrRegion *neighbor;  // next region on the right, or NULL
 } OcrRegion;
 
+
 typedef struct {
     OcrRegion **regions;  // указатели на регионы в этой строке
     int      count;    // сколько регионов в строке
     int minx, miny, maxx, maxy; // computed bbox
 } Line;
 
+
 typedef struct {
     char ch;
     uint8_t mask[TEMPLATE_BYTES];
 } CharTemplate;
 
+
 /* ========== Глобальные переменные ========== */
+
 extern CharTemplate templates[];
 extern int n_templates;
+
 
 /* ========== Общие функции ========== */
 
@@ -187,9 +228,9 @@ void platform_cleanup(GlobalContext *ctx);
 bool platform_capture_screen(GlobalContext *ctx, int slot_index);
 
 // Platform-specific квантизация изображений
-void platform_quantize_bgr_to_rgb332(const uint8_t *bgr_data, uint8_t *quant_data, 
+void platform_quantize_bgr_to_rgb332(const uint8_t *bgr_data, uint8_t *quant_data,
                                       int width, int height, int padded_width);
-void platform_quantize_rgba_to_rgb332(const uint8_t *rgba_data, uint8_t *quant_data, 
+void platform_quantize_rgba_to_rgb332(const uint8_t *rgba_data, uint8_t *quant_data,
                                        int width, int height, int padded_width, int bytes_per_line);
 
 // Объявления общих функций обработки
