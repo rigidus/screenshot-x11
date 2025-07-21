@@ -19,31 +19,7 @@ CharTemplate templates[] = {
 };
 int n_templates = sizeof(templates) / sizeof(templates[0]);
 
-/* ========== Конвертация форматов ========== */
-
-void convert_bgr_to_rgba(const uint8_t *bgr_data, uint8_t *rgba_data, int width, int height) {
-    // Конвертируем BGR (3 байта) в RGBA (4 байта)
-    // BGR: [B][G][R] -> RGBA: [R][G][B][A]
-
-    const uint8_t *src = bgr_data;
-    uint8_t *dst = rgba_data;
-
-    for (int i = 0; i < width * height; ++i) {
-        uint8_t b = src[0];
-        uint8_t g = src[1];
-        uint8_t r = src[2];
-
-        dst[0] = r;  // R
-        dst[1] = g;  // G
-        dst[2] = b;  // B
-        dst[3] = 255; // A (полная непрозрачность)
-
-        src += 3;  // следующий BGR пиксель
-        dst += 4;  // следующий RGBA пиксель
-    }
-}
-
-/* ========== SIMD оптимизации ========== */
+/* ========== SIMD оптимизации (неиспользуемые в текущей версии) ========== */
 
 // SIMD‐проверка однородности 32-байтного региона
 bool block_uniform_avx2(const uint8_t *quant, int pw, int sy, int sx) {
@@ -338,9 +314,9 @@ char recognize_region(const OcrRegion *reg) {
     return best_score >= MATCH_THRESHOLD ? best_ch : '?';
 }
 
-/* ========== Квантование и анализ ========== */
+/* ========== Функция анализа блоков ========== */
 
-void quantize_and_analyze(FrameSlot *slot, GlobalContext *ctx) {
+void analyze_blocks(FrameSlot *slot, GlobalContext *ctx) {
     const int W  = ctx->w;
     const int H  = ctx->h;
     const int pw = ctx->padded_w;
@@ -348,98 +324,7 @@ void quantize_and_analyze(FrameSlot *slot, GlobalContext *ctx) {
     const int br = ctx->block_rows;
     const size_t mask_sz = ((size_t)BS * BS + 7) / 8;
 
-    // Конвертируем платформо-зависимые данные в унифицированный RGBA формат
-#ifdef PLATFORM_WINDOWS
-    // Windows: BGR (3 байта) -> RGBA (4 байта)
-    convert_bgr_to_rgba(slot->raw, slot->rgba, W, H);
-#else
-    // Linux: уже RGBA (4 байта), просто копируем
-    memcpy(slot->rgba, slot->raw, (size_t)W * H * 4);
-#endif
-
-    // Однократный детект SIMD возможностей
-    static bool inited = false;
-    static bool use256;
-    if (!inited) {
-        use256 = cpu_has_avx2();
-        inited = true;
-        printf("[init] AVX2 support: %s\n", use256 ? "yes" : "no");
-    }
-
-    // 1) Векторное квантование RGBA → RGB332
-    // Теперь все платформы используют единый RGBA формат
-    for (int y = 0; y < H; ++y) {
-        const uint8_t *row_src = slot->rgba + (size_t)y * W * 4;  // Унифицированный RGBA
-        uint8_t *row_q = slot->quant + (size_t)y * pw;
-        int x = 0;
-
-#if defined(__AVX2__) && (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86))
-        if (use256) {
-            __m256i mR = _mm256_set1_epi32(0xE0);
-            __m256i mB = _mm256_set1_epi32(0xC0);
-            int lim8 = (W/8)*8;
-            for (; x < lim8; x += 8) {
-                __m256i pix = _mm256_loadu_si256((__m256i*)(row_src + x*4));
-                __m256i r   = _mm256_and_si256(_mm256_srli_epi32(pix,16), mR);
-                __m256i g2  = _mm256_and_si256(_mm256_srli_epi32(pix, 8), mR);
-                __m256i b   = _mm256_and_si256(pix, mB);
-                __m256i rg  = _mm256_or_si256(r, _mm256_srli_epi32(g2,3));
-                __m256i rgb = _mm256_or_si256(rg, _mm256_srli_epi32(b,6));
-                __m128i lo  = _mm256_castsi256_si128(rgb);
-                __m128i hi  = _mm256_extracti128_si256(rgb,1);
-                __m128i p16 = _mm_packus_epi32(lo, hi);
-                __m128i p8  = _mm_packus_epi16(p16, _mm_setzero_si128());
-                _mm_storel_epi64((__m128i*)(row_q + x), p8);
-            }
-        }
-#endif
-
-        // SSE2 путь (обрабатывает хвосты и если AVX2 нет)
-#if defined(__SSE2__) && (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86))
-        {
-            __m128i mR4 = _mm_set1_epi32(0xE0);
-            __m128i mB4 = _mm_set1_epi32(0xC0);
-            int lim4 = (W/4)*4;
-            for (; x < lim4; x += 4) {
-                __m128i pix = _mm_loadu_si128((__m128i*)(row_src + x*4));
-                __m128i r   = _mm_and_si128(_mm_srli_epi32(pix,16), mR4);
-                __m128i g2  = _mm_and_si128(_mm_srli_epi32(pix, 8), mR4);
-                __m128i b   = _mm_and_si128(pix, mB4);
-                __m128i rg  = _mm_or_si128(r, _mm_srli_epi32(g2,3));
-                __m128i rgb = _mm_or_si128(rg,_mm_srli_epi32(b,6));
-                __m128i p16 = _mm_packus_epi32(rgb, _mm_setzero_si128());
-                __m128i p8  = _mm_packus_epi16(p16, _mm_setzero_si128());
-                *(uint32_t*)(row_q + x) = _mm_cvtsi128_si32(p8);
-            }
-        }
-#endif
-
-        // Скаляный хвост + паддинг
-        // Теперь единый код для всех платформ (RGBA)
-        for (; x < W; ++x) {
-            uint8_t R = row_src[x*4+0];  // Унифицированный RGBA
-            uint8_t G = row_src[x*4+1];
-            uint8_t B = row_src[x*4+2];
-            // A игнорируем
-            uint8_t R3 = R >> 5, G3 = G >> 5, B2 = B >> 6;
-            row_q[x] = (uint8_t)((R3<<5)|(G3<<2)|B2);
-        }
-        for (; x < pw; ++x) {
-            row_q[x] = 0;
-        }
-    }
-
-    // Заполняем padding строки
-    for (int y = H; y < ctx->padded_h; ++y) {
-        uint8_t *row_q = slot->quant + (size_t)y * pw;
-        memset(row_q, 0, pw);
-    }
-
-#ifdef __SSE2__
-    _mm_sfence();  // дождаться store
-#endif
-
-    // 2) Анализ блоков 32×32 → bg/fg/mask
+    // Анализ блоков 32×32 → bg/fg/mask
     for (int by = 0; by < br; ++by) {
         for (int bx = 0; bx < bc; ++bx) {
             int idx = by*bc + bx;
@@ -498,31 +383,4 @@ void quantize_and_analyze(FrameSlot *slot, GlobalContext *ctx) {
             }
         }
     }
-}
-
-/* ========== Функции вывода изображений ========== */
-
-void dump_png_rgb(const char *fname, int W, int H, const uint8_t *rgb) {
-    // Конвертируем PNG в BMP для совместимости
-    char bmp_fname[512];
-    strcpy(bmp_fname, fname);
-    char *ext = strstr(bmp_fname, ".png");
-    if (ext) strcpy(ext, ".bmp");
-
-    // Конвертируем RGB в RGBA и сохраняем как BMP
-    uint8_t *rgba = malloc((size_t)W * H * 4);
-    if (!rgba) {
-        printf("[error] Failed to allocate memory for RGBA conversion\n");
-        return;
-    }
-
-    for (int i = 0; i < W * H; i++) {
-        rgba[i*4+0] = rgb[i*3+0]; // R
-        rgba[i*4+1] = rgb[i*3+1]; // G
-        rgba[i*4+2] = rgb[i*3+2]; // B
-        rgba[i*4+3] = 255;        // A
-    }
-
-    dump_rgba_as_bmp(bmp_fname, W, H, rgba);
-    free(rgba);
 }

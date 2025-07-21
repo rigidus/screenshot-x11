@@ -14,7 +14,7 @@
 #include <wingdi.h>
 
 #ifndef _SC_NPROCESSORS_ONLN
-#define _SC_NPROCESSORS_ONLN 84
+#define _SC_NPROCESSORS_ONLN 4
 #endif
 
 #ifndef CLOCK_REALTIME
@@ -87,6 +87,53 @@ int sched_yield(void) {
     return 0;
 }
 
+
+/* ========== Windows квантизация ========== */
+
+void platform_quantize_bgr_to_rgb332(const uint8_t *bgr_data, uint8_t *quant_data, 
+                                      int width, int height, int padded_width) {
+    // Однократный детект SIMD возможностей
+    static bool inited = false;
+    static bool use256;
+    if (!inited) {
+        use256 = cpu_has_avx2();
+        inited = true;
+        printf("[init] AVX2 support for BGR quantization: %s\n", use256 ? "yes" : "no");
+    }
+
+    // Квантование BGR → RGB332
+    for (int y = 0; y < height; ++y) {
+        const uint8_t *row_src = bgr_data + (size_t)y * width * 3;  // BGR (3 байта на пиксель)
+        uint8_t *row_q = quant_data + (size_t)y * padded_width;
+        int x = 0;
+
+        // Скалярная версия (BGR)
+        for (; x < width; ++x) {
+            uint8_t B = row_src[x*3+0];  // BGR
+            uint8_t G = row_src[x*3+1];
+            uint8_t R = row_src[x*3+2];
+            uint8_t R3 = R >> 5, G3 = G >> 5, B2 = B >> 6;
+            row_q[x] = (uint8_t)((R3<<5)|(G3<<2)|B2);
+        }
+        
+        // Паддинг
+        for (; x < padded_width; ++x) {
+            row_q[x] = 0;
+        }
+    }
+
+    // Заполняем padding строки
+    int block_rows = (height + BS - 1) / BS;
+    int padded_height = block_rows * BS;
+    for (int y = height; y < padded_height; ++y) {
+        uint8_t *row_q = quant_data + (size_t)y * padded_width;
+        memset(row_q, 0, padded_width);
+    }
+
+#ifdef __SSE2__
+    _mm_sfence();  // дождаться store
+#endif
+}
 
 /* ========== Реализация платформо-зависимых функций ========== */
 
@@ -182,10 +229,15 @@ bool platform_capture_screen(GlobalContext *ctx, int slot_index) {
         return false;
     }
     
-    // Устанавливаем указатель на raw данные (Windows BGR, будет конвертировано в RGBA)
+    // Устанавливаем указатель на raw данные для отладки
     ctx->slot[slot_index].raw = pdata->bitmap_data[slot_index];
+    
+    // Прямая квантизация BGR → RGB332
+    platform_quantize_bgr_to_rgb332(pdata->bitmap_data[slot_index], 
+                                     ctx->slot[slot_index].quant,
+                                     ctx->w, ctx->h, ctx->padded_w);
     
     return true;
 }
 
-#endif /* PLATFORM_WINDOWS */
+#endif

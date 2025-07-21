@@ -2,6 +2,13 @@ CC     := gcc
 CFLAGS := -O3 -std=c17 -Wall -Wextra -pedantic -D_GNU_SOURCE -msse4.1
 LIBPNG := -lpng
 
+# Настройка пути сохранения скриншотов (можно переопределить через make SCREENSHOT_PATH="/custom/path/")
+ifdef SCREENSHOT_PATH
+    SCREENSHOT_DEF := -DSCREENSHOT_PATH=\"$(SCREENSHOT_PATH)\"
+else
+    SCREENSHOT_DEF :=
+endif
+
 # Определение платформы
 ifeq ($(OS),Windows_NT)
     PLATFORM := windows
@@ -56,17 +63,22 @@ rectfinder_top15: src/rectfinder_top15.cpp
 # Кроссплатформенная сборка xcape_pipe
 xcape_pipe: $(XCAPE_SRC)/xcape_pipe.c $(XCAPE_SRC)/processing.c $(XCAPE_SRC)/debug.c $(XCAPE_SRC)/common.h
 ifeq ($(PLATFORM),windows)
-	$(CC) $(CFLAGS) $(PLATFORM_DEF) -mconsole -I$(XCAPE_SRC) \
+	$(CC) $(CFLAGS) $(PLATFORM_DEF) $(SCREENSHOT_DEF) -mconsole -I$(XCAPE_SRC) \
 		$(XCAPE_SRC)/xcape_pipe.c $(XCAPE_SRC)/processing.c $(XCAPE_SRC)/debug.c $(XCAPE_SRC)/windows.c \
 		$(PLATFORM_LIBS) $(LIBPNG) -o $@$(EXE_SUFFIX)
 else
-	$(CC) $(CFLAGS) $(PLATFORM_DEF) -I$(XCAPE_SRC) -pthread \
+	$(CC) $(CFLAGS) $(PLATFORM_DEF) $(SCREENSHOT_DEF) -I$(XCAPE_SRC) -pthread \
 		$(XCAPE_SRC)/xcape_pipe.c $(XCAPE_SRC)/processing.c $(XCAPE_SRC)/debug.c $(XCAPE_SRC)/linux.c \
 		$(PLATFORM_LIBS) $(LIBPNG) -o $@$(EXE_SUFFIX)
 endif
 
 viewer: src/viewer.c
 	gcc -O2 -std=c17 -Wall -Wextra $< -lpng -o $@$(EXE_SUFFIX)
+
+# Примеры сборки с настройкой пути для скриншотов:
+# make xcape_pipe                                    # Использует стандартные пути (C:\Tmp\ для Windows, /tmp/ для Linux)
+# make xcape_pipe SCREENSHOT_PATH="/home/user/screenshots/"  # Пользовательский путь для Linux
+# make xcape_pipe SCREENSHOT_PATH="C:\\Screenshots\\"        # Пользовательский путь для Windows
 
 clean:
 	rm -f $(BIN) frame_*.png *_*.png
