@@ -1,38 +1,37 @@
 CC      := gcc
 CFLAGS  := -O3 -std=c17 -Wall -Wextra -pedantic -D_GNU_SOURCE -msse4.1
-LIBPNG  := -lpng
 SRCPATH := screenshot
 BIN     := xcape_pipe
 
 ifeq ($(OS),Windows_NT)
     PLATFORM           := windows
     PLATFORM_SRC       := $(SRCPATH)/windows.c
-    PLATFORM_LIBS      := -lgdi32 -luser32 -lkernel32 $(LIBPNG)
+    PLATFORM_LIBS      := -lgdi32 -luser32 -lkernel32 -lpng
     XLIBS              :=
     EXE_SUFFIX         := .exe
     PLATFORM_DEF       := -DPLATFORM_WINDOWS
     PLATFORM_CFLAGS    := $(CFLAGS) $(PLATFORM_DEF) -mconsole -I$(SRCPATH)
-    PLATFORM_SHOT_PATH := "C:\\Tmp\\"
+    PLATFORM_SHOT_PATH := -DSCREENSHOT_PATH=\"C:/Tmp/\"
 else
     UNAME_S := $(shell uname -s)
     ifeq ($(UNAME_S),Darwin)
         PLATFORM           := macos
-        PLATFORM_SRC       := $(SRCPATH)/linux.c
-        PLATFORM_LIBS      := -framework Cocoa -framework QuartzCore $(LIBPNG)
+        PLATFORM_SRC       := $(SRCPATH)/macos.c
+        PLATFORM_LIBS      := -framework Cocoa -framework QuartzCore -lpng
         XLIBS              :=
         EXE_SUFFIX         :=
         PLATFORM_DEF       := -DPLATFORM_MACOS
         PLATFORM_CFLAGS    := $(CFLAGS) $(PLATFORM_DEF) -I$(SRCPATH)
-        PLATFORM_SHOT_PATH := "./pics/"
+        PLATFORM_SHOT_PATH := -DSCREENSHOT_PATH=\"./pics/\"
     else ifeq ($(UNAME_S),Linux)
         PLATFORM           := linux
         PLATFORM_SRC       := $(SRCPATH)/linux.c
-        PLATFORM_LIBS      := -lX11 -lXext -lnuma -lpthread $(LIBPNG)
+        PLATFORM_LIBS      := -lX11 -lXext -lnuma -lpthread -lpng
         XLIBS              := -lX11 -lXext
         EXE_SUFFIX         :=
         PLATFORM_DEF       := -DPLATFORM_LINUX
         PLATFORM_CFLAGS    := $(CFLAGS) $(PLATFORM_DEF) -I$(SRCPATH) -pthread
-        PLATFORM_SHOT_PATH := "./tmp/"
+        PLATFORM_SHOT_PATH := -DSCREENSHOT_PATH=\"./tmp/\"
     else
         $(error Unsupported platform: $(UNAME_S))
     endif
@@ -43,21 +42,25 @@ COMMON      := xcape_pipe.c processing.c debug.c common.h
 COMMON_SRCS := $(addprefix $(SRCPATH)/,$(COMMON))
 
 
-# теперь цель зависит от «общих» + одного платформенного
-xcape_pipe: $(COMMON_SRCS) $(PLATFORM_SRC)
-	$(CC) \
-	$(PLATFORM_CFLAGS)    \
-	$(COMMON_SRCS)        \
-	$(PLATFORM_SRC)       \
-	$(PLATFORM_LIBS)      \
-	$(PLATFORM_SHOT_PATH) \
-	-o $@$(EXE_SUFFIX)
+$(BIN)$(EXE_SUFFIX): $(COMMON_SRCS) $(PLATFORM_SRC)
+	$(CC)  \
+	$(PLATFORM_CFLAGS)  \
+	$(PLATFORM_SHOT_PATH)  \
+	$(COMMON_SRCS)  \
+	$(PLATFORM_SRC)  \
+	$(PLATFORM_LIBS)  \
+	-o $(BIN)$(EXE_SUFFIX)
 
 
 clean:
-	rm -f $(BIN) frame_*.png *_*.png *.bmp qimg_* dbg_*
+	rm -f $(BIN)$(EXE_SUFFIX) frame_*.png *_*.png *.bmp qimg_* dbg_*
+
 
 dbg:
 	./xcape_pipe --slots=1
 
-.PHONY: all clean
+
+all: $(BIN)$(EXE_SUFFIX)
+
+
+.PHONY: clean dbg all
