@@ -25,6 +25,11 @@
     int pthread_join(pthread_t thread, void **retval);
     long sysconf(int name);
     int sched_yield(void);
+
+    // хотел утащить в windows.с но не понял как
+    #ifndef _SC_NPROCESSORS_ONLN
+        #define _SC_NPROCESSORS_ONLN 4
+    #endif
 #endif
 
 #include <math.h>
@@ -36,8 +41,6 @@ static GlobalContext g;
 /* ========== Общие функции обработки ========== */
 
 void allocate_bigmem(GlobalContext *ctx) {
-    // размер RGBA буфера (4 байта на пиксель)
-    size_t rgba_sz = (size_t)ctx->w * ctx->h * 4;
     // размер квант-буфера (1 байт на пиксель (RGB332)) с паддингом
     size_t q_sz = (size_t)ctx->padded_w * ctx->padded_h * 1;
     // размер буфера цветов фона всех блоков (1 байт на цвет)
@@ -50,8 +53,7 @@ void allocate_bigmem(GlobalContext *ctx) {
     size_t mask_sz = ctx->block_count * single_mask;
 
     // смещения с учётом выравниваний
-    size_t offset_rgba  = 0;
-    size_t offset_quant = align_up(offset_rgba + rgba_sz);
+    size_t offset_quant = 0;
     size_t offset_bg    = align_up(offset_quant + q_sz);
     size_t offset_fg    = align_up(offset_bg + bg_sz);
     size_t offset_mask  = align_up(offset_fg + fg_sz);
@@ -79,15 +81,14 @@ void allocate_bigmem(GlobalContext *ctx) {
         ctx->slot[i] = (FrameSlot){
             .st = FREE,
             .raw   = NULL,  // будет установлен при захвате
-            .rgba  = base + offset_rgba,
             .quant = base + offset_quant,
             .bg    = base + offset_bg,
             .fg    = base + offset_fg,
             .mask  = base + offset_mask,
             .block_count = ctx->block_count
         };
-        printf("[slot %u] rgba=%p quant=%p bg=%p fg=%p mask=%p\n",
-               i, ctx->slot[i].rgba, ctx->slot[i].quant, ctx->slot[i].bg,
+        printf("[slot %u] quant=%p bg=%p fg=%p mask=%p\n",
+               i, ctx->slot[i].quant, ctx->slot[i].bg,
                ctx->slot[i].fg, ctx->slot[i].mask);
     }
 }
@@ -150,8 +151,8 @@ static void *worker_thread(void *arg) {
             if (atomic_compare_exchange_strong(&s->st, &expected, IN_PROGRESS)) {
                 printf("[worker %u] Processing slot %u\n", worker_id, i);
 
-                // === Квантование RGB332 + анализ uniform-блоков 32×32
-                quantize_and_analyze(s, &g);
+                // === Анализ uniform-блоков 32×32 ===
+                analyze_blocks(s, &g);
 
                 // Отладочные дампы (включаем для проверки)
                 debug_dump_quant(i, s->quant, g.padded_w, &g);
@@ -273,14 +274,9 @@ static void *serializer_thread(void *arg) {
                          (unsigned long long)s->t_start);
 #endif
 
-                // Сохраняем скриншот
-                if (s->rgba) {
-                    printf("[serializer] Saving processed file: %s\n", bmp_filename);
-                    dump_rgba_as_bmp(bmp_filename, g.w, g.h, s->rgba);
-                    printf("[serializer] Successfully saved screenshot to: %s\n", bmp_filename);
-                } else {
-                    printf("[serializer] Warning: no RGBA data in slot %u\n", i);
-                }
+                // Сохраняем квантованное изображение как отладочную информацию
+                printf("[serializer] Saving processed quant data for slot %u\n", i);
+                debug_dump_quant(i, s->quant, g.padded_w, &g);
 
                 printf("[serializer] Processing slot %u completed (time: %llu ns)\n",
                        i, (unsigned long long)(now_ns() - s->t_start));
@@ -320,11 +316,7 @@ int main(int argc, char **argv) {
     }
 
     // Определяем число рабочих потоков
-#ifdef PLATFORM_WINDOWS
-    long cores = sysconf(4); // Используем числовое значение для Windows
-#else
     long cores = sysconf(_SC_NPROCESSORS_ONLN);
-#endif
     g.workers = (cores > 4) ? cores - 3 : 1;
 
     // Инициализация платформы для захвата скриншотов

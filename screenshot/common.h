@@ -28,6 +28,18 @@
 /* ========== Константы ========== */
 #define BS 32
 #define MAX_SLOTS 8
+
+/* ========== Пути сохранения скриншотов ========== */
+#ifndef SCREENSHOT_PATH
+    #ifdef PLATFORM_WINDOWS
+        #define SCREENSHOT_PATH "C:\\Tmp\\"
+    #else
+        #define SCREENSHOT_PATH "/tmp/"
+    #endif
+#endif
+
+// Максимальная длина полного пути к файлу
+#define MAX_SCREENSHOT_PATH 512
 #define DEFAULT_SLOTS 4
 #define MIXED 0xFF
 #define MAX_NEIGHBOR_GAP 32
@@ -39,11 +51,7 @@
 #define MATCH_THRESHOLD 0.75f
 #define MAX_REGIONS 1024
 #define COLOR_MIXED 0xFFFF
-#ifdef PLATFORM_WINDOWS
-    #define PIPE_PATH_BASE "screenshot_pipe"
-#else
-    #define PIPE_PATH "/tmp/screenshot_pipe"
-#endif
+
 #define STALL_NS 1000000000ull
 #define MAGIC_QIMG 0x51494D47u
 #define ALIGN 128
@@ -63,7 +71,6 @@ typedef struct {
     _Atomic enum slot_state st;
     uint64_t  t_start;
     uint8_t  *raw;         // указатель на сырое изображение RGB/BGR от платформы
-    uint8_t  *rgba;        // унифицированные RGBA данные (4 байта на пиксель)
     uint8_t  *quant;       // RGB332 (один байт на пиксель)
     uint8_t  *bg;          // фоновой цвет каждого блока
     uint8_t  *fg;          // цвет текста - второй по распространенности
@@ -179,13 +186,19 @@ bool platform_init(GlobalContext *ctx);
 void platform_cleanup(GlobalContext *ctx);
 bool platform_capture_screen(GlobalContext *ctx, int slot_index);
 
-// Конвертация форматов
-void convert_bgr_to_rgba(const uint8_t *bgr_data, uint8_t *rgba_data, int width, int height);
+// Platform-specific квантизация изображений
+void platform_quantize_bgr_to_rgb332(const uint8_t *bgr_data, uint8_t *quant_data, 
+                                      int width, int height, int padded_width);
+void platform_quantize_rgba_to_rgb332(const uint8_t *rgba_data, uint8_t *quant_data, 
+                                       int width, int height, int padded_width, int bytes_per_line);
 
 // Объявления общих функций обработки
 void allocate_bigmem(GlobalContext *ctx);
-void quantize_and_analyze(FrameSlot *slot, GlobalContext *ctx);
+void analyze_blocks(FrameSlot *slot, GlobalContext *ctx);
 void dump_png_rgb(const char *fname, int W, int H, const uint8_t *rgb);
+
+// Функции работы с путями
+void create_screenshot_path(char *full_path, size_t path_size, const char *filename);
 
 // SIMD функции
 bool block_uniform_avx2(const uint8_t *quant, int pw, int sy, int sx);
@@ -208,7 +221,6 @@ void debug_recognize(int slot_idx, OcrRegion *regions, int region_n);
 void debug_dump_lines(int slot_idx, Line *lines, int line_n, GlobalContext *ctx);
 void debug_dump_chains(int slot_idx, OcrRegion *regions, int region_n, GlobalContext *ctx);
 void dump_rgba_as_bmp(const char *fname, int W, int H, const uint8_t *rgba);
-void dump_png_rgb(const char *fname, int W, int H, const uint8_t *rgb);
 
 // Утилиты
 static inline int popcount8(uint8_t v) {
@@ -225,4 +237,4 @@ static inline int popcount8(uint8_t v) {
 #endif
 }
 
-#endif /* COMMON_H */
+#endif

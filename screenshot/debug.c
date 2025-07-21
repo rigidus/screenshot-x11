@@ -1,6 +1,49 @@
 #include "common.h"
 
+/* ========== Вспомогательные функции путей ========== */
+
+void create_screenshot_path(char *full_path, size_t path_size, const char *filename) {
+    #ifdef PLATFORM_WINDOWS
+        // По умолчанию сохраняем в C:\Tmp
+        const char *screenshot_dir = "C:\\Tmp";
+        snprintf(full_path, path_size, "%s\\%s", screenshot_dir, filename);
+    #else
+        snprintf(full_path, path_size, "%s%s", SCREENSHOT_PATH, filename);
+    #endif
+}
+
 /* ========== Отладочные функции ========== */
+
+void dump_png_rgb(const char *fname, int W, int H, const uint8_t *rgb) {
+    // Создаем полный путь к файлу
+    char full_path[MAX_SCREENSHOT_PATH];
+    create_screenshot_path(full_path, sizeof(full_path), fname);
+    
+    // Конвертируем PNG в BMP для совместимости
+    char bmp_fname[MAX_SCREENSHOT_PATH];
+    strcpy(bmp_fname, full_path);
+    char *ext = strstr(bmp_fname, ".png");
+    if (ext) strcpy(ext, ".bmp");
+
+    // Конвертируем RGB в RGBA и сохраняем как BMP
+    uint8_t *rgba = malloc((size_t)W * H * 4);
+    if (!rgba) {
+        printf("[error] Failed to allocate memory for RGBA conversion\n");
+        return;
+    }
+
+    for (int i = 0; i < W * H; i++) {
+        rgba[i*4+0] = rgb[i*3+0]; // R
+        rgba[i*4+1] = rgb[i*3+1]; // G
+        rgba[i*4+2] = rgb[i*3+2]; // B
+        rgba[i*4+3] = 255;        // A
+    }
+
+    printf("[debug] Saving screenshot: %s\n", bmp_fname);
+    dump_rgba_as_bmp(bmp_fname, W, H, rgba);
+    free(rgba);
+}
+
 
 // Функция для сохранения RGBA данных как BMP
 void dump_rgba_as_bmp(const char *fname, int W, int H, const uint8_t *rgba) {

@@ -5,31 +5,34 @@ SRCPATH := screenshot
 BIN     := xcape_pipe
 
 ifeq ($(OS),Windows_NT)
-    PLATFORM       := windows
-	PLATFORM_SRC   := $(SRCPATH)/windows.c
-    PLATFORM_LIBS  := -lgdi32 -luser32 -lkernel32 $(LIBPNG)
-    XLIBS          :=
-    EXE_SUFFIX     := .exe
-    PLATFORM_DEF   := -DPLATFORM_WINDOWS
-    PLATFORM_CFLAGS := $(CFLAGS) $(PLATFORM_DEF) -mconsole -I$(SRCPATH)
+    PLATFORM           := windows
+    PLATFORM_SRC       := $(SRCPATH)/windows.c
+    PLATFORM_LIBS      := -lgdi32 -luser32 -lkernel32 $(LIBPNG)
+    XLIBS              :=
+    EXE_SUFFIX         := .exe
+    PLATFORM_DEF       := -DPLATFORM_WINDOWS
+    PLATFORM_CFLAGS    := $(CFLAGS) $(PLATFORM_DEF) -mconsole -I$(SRCPATH)
+    PLATFORM_SHOT_PATH := "C:\\Tmp\\"
 else
     UNAME_S := $(shell uname -s)
     ifeq ($(UNAME_S),Darwin)
-        PLATFORM       := macos
-		PLATFORM_SRC   := $(SRCPATH)/linux.c
-        PLATFORM_LIBS  := -framework Cocoa -framework QuartzCore $(LIBPNG)
-        XLIBS          :=
-        EXE_SUFFIX     :=
-        PLATFORM_DEF   := -DPLATFORM_MACOS
-        PLATFORM_CFLAGS := $(CFLAGS) $(PLATFORM_DEF) -I$(SRCPATH)
+        PLATFORM           := macos
+        PLATFORM_SRC       := $(SRCPATH)/linux.c
+        PLATFORM_LIBS      := -framework Cocoa -framework QuartzCore $(LIBPNG)
+        XLIBS              :=
+        EXE_SUFFIX         :=
+        PLATFORM_DEF       := -DPLATFORM_MACOS
+        PLATFORM_CFLAGS    := $(CFLAGS) $(PLATFORM_DEF) -I$(SRCPATH)
+        PLATFORM_SHOT_PATH := "./pics/"
     else ifeq ($(UNAME_S),Linux)
-        PLATFORM       := linux
-		PLATFORM_SRC   := $(SRCPATH)/linux.c
-        PLATFORM_LIBS  := -lX11 -lXext -lnuma -lpthread $(LIBPNG)
-        XLIBS          := -lX11 -lXext
-        EXE_SUFFIX     :=
-        PLATFORM_DEF   := -DPLATFORM_LINUX
-        PLATFORM_CFLAGS := $(CFLAGS) $(PLATFORM_DEF) -I$(SRCPATH) -pthread
+        PLATFORM           := linux
+        PLATFORM_SRC       := $(SRCPATH)/linux.c
+        PLATFORM_LIBS      := -lX11 -lXext -lnuma -lpthread $(LIBPNG)
+        XLIBS              := -lX11 -lXext
+        EXE_SUFFIX         :=
+        PLATFORM_DEF       := -DPLATFORM_LINUX
+        PLATFORM_CFLAGS    := $(CFLAGS) $(PLATFORM_DEF) -I$(SRCPATH) -pthread
+        PLATFORM_SHOT_PATH := "./tmp/"
     else
         $(error Unsupported platform: $(UNAME_S))
     endif
@@ -43,16 +46,16 @@ COMMON_SRCS := $(addprefix $(SRCPATH)/,$(COMMON))
 # теперь цель зависит от «общих» + одного платформенного
 xcape_pipe: $(COMMON_SRCS) $(PLATFORM_SRC)
 	$(CC) \
-		$(PLATFORM_CFLAGS) \
-		$(COMMON_SRCS) \
-		$(PLATFORM_SRC) \
-		$(PLATFORM_LIBS) \
-		-o $@$(EXE_SUFFIX)
+	$(PLATFORM_CFLAGS)    \
+	$(COMMON_SRCS)        \
+	$(PLATFORM_SRC)       \
+	$(PLATFORM_LIBS)      \
+	$(PLATFORM_SHOT_PATH) \
+	-o $@$(EXE_SUFFIX)
+
 
 clean:
-	rm -f $(BIN) frame_*.png *_*.png *.bmp
-	rm qimg_*
-	rm dbg_*
+	rm -f $(BIN) frame_*.png *_*.png *.bmp qimg_* dbg_*
 
 dbg:
 	./xcape_pipe --slots=1
