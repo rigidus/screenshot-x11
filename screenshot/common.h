@@ -11,9 +11,17 @@
 #include <png.h>
 #include <math.h>
 #include <limits.h>
-#include <emmintrin.h>  // SSE2
-#include <immintrin.h>  // AVX2
-#include <xmmintrin.h>  // SSE
+#include <sched.h>
+
+/* #if defined(__SSE2__) || defined(__AVX2__) */
+/* …интринсики… */
+/* #endif */
+
+#if defined(__x86_64__) || defined(_M_X64)  /* только под x86 */
+    #include <emmintrin.h>  // SSE2
+    #include <immintrin.h>  // AVX2
+    #include <xmmintrin.h>  // SSE
+#endif
 
 /* Для определения количества ядер в get_num_cores */
 #if defined(_WIN32)
@@ -35,18 +43,21 @@
         #define PLATFORM_WINDOWS
     #endif
     #include <windows.h>    // QueryPerformanceCounter и пр.
-
+    int sched_yield(void);
 #elif defined(__linux__)
     #ifndef PLATFORM_LINUX
         #define PLATFORM_LINUX
     #endif
     #include <numa.h>       // libnuma
+    #include <pthread.h>
+    #include <shed.h>
 
 #elif defined(__APPLE__)
     #ifndef PLATFORM_MACOS
         #define PLATFORM_MACOS
     #endif
-
+    #include <pthread.h>
+    int sched_yield(void);
 #else
     #error "Unsupported platform"
 #endif
@@ -96,7 +107,7 @@
 
 #define STALL_NS 1000000000ull
 #define MAGIC_QIMG 0x51494D47u
-#define ALIGN 128
+#define ALIGN_UP 128
 
 #ifndef MIN
 #define MIN(a,b) ((a) < (b) ? (a) : (b))
@@ -217,7 +228,7 @@ static inline uint8_t expand3(uint8_t v) {
 
 // Выравнивание памяти
 static inline size_t align_up(size_t x) {
-    return (x + (ALIGN - 1)) & ~(ALIGN - 1);
+    return (x + (ALIGN_UP - 1)) & ~(ALIGN_UP - 1);
 }
 
 // SIMD проверки
