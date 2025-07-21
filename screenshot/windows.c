@@ -2,7 +2,7 @@
 
 /*
  * Windows-специфичная реализация xcape_pipe
- * 
+ *
  * Необходимые DLL для запуска:
  * - libpng16-16.dll  (работа с PNG изображениями)
  * - libwinpthread-1.dll (POSIX threads для MinGW)
@@ -12,10 +12,6 @@
 #include "common.h"
 #include <windows.h>
 #include <wingdi.h>
-
-#ifndef _SC_NPROCESSORS_ONLN
-#define _SC_NPROCESSORS_ONLN 4
-#endif
 
 #ifndef CLOCK_REALTIME
 #define CLOCK_REALTIME 0
@@ -56,10 +52,10 @@ int pthread_create(pthread_t *thread, const pthread_attr_t *attr, void *(*start_
     (void)attr;
     thread_data_t *data = malloc(sizeof(thread_data_t));
     if (!data) return -1;
-    
+
     data->start_routine = start_routine;
     data->arg = arg;
-    
+
     HANDLE h = CreateThread(NULL, 0, thread_wrapper, data, 0, NULL);
     *thread = (void*)h;  // Приводим HANDLE к void*
     return (h == NULL) ? -1 : 0;
@@ -73,15 +69,6 @@ int pthread_join(pthread_t thread, void **retval) {
     return 0;
 }
 
-long sysconf(int name) {
-    if (name == _SC_NPROCESSORS_ONLN) {
-        SYSTEM_INFO si;
-        GetSystemInfo(&si);
-        return si.dwNumberOfProcessors;
-    }
-    return -1;
-}
-
 int sched_yield(void) {
     SwitchToThread();
     return 0;
@@ -90,7 +77,7 @@ int sched_yield(void) {
 
 /* ========== Windows квантизация ========== */
 
-void platform_quantize_bgr_to_rgb332(const uint8_t *bgr_data, uint8_t *quant_data, 
+void platform_quantize_bgr_to_rgb332(const uint8_t *bgr_data, uint8_t *quant_data,
                                       int width, int height, int padded_width) {
     // Однократный детект SIMD возможностей
     static bool inited = false;
@@ -115,7 +102,7 @@ void platform_quantize_bgr_to_rgb332(const uint8_t *bgr_data, uint8_t *quant_dat
             uint8_t R3 = R >> 5, G3 = G >> 5, B2 = B >> 6;
             row_q[x] = (uint8_t)((R3<<5)|(G3<<2)|B2);
         }
-        
+
         // Паддинг
         for (; x < padded_width; ++x) {
             row_q[x] = 0;
@@ -140,9 +127,9 @@ void platform_quantize_bgr_to_rgb332(const uint8_t *bgr_data, uint8_t *quant_dat
 bool platform_init(GlobalContext *ctx) {
     WindowsPlatformData *pdata = malloc(sizeof(WindowsPlatformData));
     if (!pdata) return false;
-    
+
     ctx->platform_data = pdata;
-    
+
     // Получаем контекст экрана
     pdata->hdc_screen = GetDC(NULL);
     if (!pdata->hdc_screen) {
@@ -177,7 +164,7 @@ bool platform_init(GlobalContext *ctx) {
             return false;
         }
 
-        pdata->hbitmap[i] = CreateDIBSection(pdata->hdc_mem[i], &pdata->bmi, DIB_RGB_COLORS, 
+        pdata->hbitmap[i] = CreateDIBSection(pdata->hdc_mem[i], &pdata->bmi, DIB_RGB_COLORS,
                                            (void**)&pdata->bitmap_data[i], NULL, 0);
         if (!pdata->hbitmap[i]) {
             DeleteDC(pdata->hdc_mem[i]);
@@ -200,9 +187,9 @@ bool platform_init(GlobalContext *ctx) {
 
 void platform_cleanup(GlobalContext *ctx) {
     if (!ctx->platform_data) return;
-    
+
     WindowsPlatformData *pdata = (WindowsPlatformData*)ctx->platform_data;
-    
+
     for (uint32_t i = 0; i < ctx->slots; ++i) {
         if (pdata->hbitmap[i]) {
             DeleteObject(pdata->hbitmap[i]);
@@ -211,32 +198,32 @@ void platform_cleanup(GlobalContext *ctx) {
             DeleteDC(pdata->hdc_mem[i]);
         }
     }
-    
+
     if (pdata->hdc_screen) {
         ReleaseDC(NULL, pdata->hdc_screen);
     }
-    
+
     free(pdata);
     ctx->platform_data = NULL;
 }
 
 bool platform_capture_screen(GlobalContext *ctx, int slot_index) {
     WindowsPlatformData *pdata = (WindowsPlatformData*)ctx->platform_data;
-    
+
     // Захватываем изображение через BitBlt в DIB секцию
-    if (!BitBlt(pdata->hdc_mem[slot_index], 0, 0, ctx->w, ctx->h, 
+    if (!BitBlt(pdata->hdc_mem[slot_index], 0, 0, ctx->w, ctx->h,
                 pdata->hdc_screen, 0, 0, SRCCOPY)) {
         return false;
     }
-    
+
     // Устанавливаем указатель на raw данные для отладки
     ctx->slot[slot_index].raw = pdata->bitmap_data[slot_index];
-    
+
     // Прямая квантизация BGR → RGB332
-    platform_quantize_bgr_to_rgb332(pdata->bitmap_data[slot_index], 
+    platform_quantize_bgr_to_rgb332(pdata->bitmap_data[slot_index],
                                      ctx->slot[slot_index].quant,
                                      ctx->w, ctx->h, ctx->padded_w);
-    
+
     return true;
 }
 

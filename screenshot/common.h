@@ -15,6 +15,18 @@
 #include <immintrin.h>  // AVX2
 #include <xmmintrin.h>  // SSE
 
+/* Для определения количества ядер в get_num_cores */
+#if defined(_WIN32)
+    #include <windows.h>
+#elif defined(__linux__)
+    #include <unistd.h>
+#elif defined(__APPLE__)
+    #include <sys/types.h>
+    #include <sys/sysctl.h>
+#else
+    #error "Unsupported platform"
+#endif
+
 
 /* ========== Определение платформы ========== */
 
@@ -278,4 +290,35 @@ static inline int popcount8(uint8_t v) {
 #endif
 }
 
+
+
+/**
+ * Определяет число логических процессорных ядер
+ */
+static inline int get_num_cores(void) {
+#if defined(_WIN32)
+    SYSTEM_INFO info;
+    GetSystemInfo(&info);
+    return (int)info.dwNumberOfProcessors;
+
+#elif defined(__linux__)
+    long n = sysconf(_SC_NPROCESSORS_ONLN);
+    return (n > 0 ? (int)n : 1);
+
+#elif defined(__APPLE__)
+    int mib[2];
+    uint32_t count;
+    size_t len = sizeof(count);
+
+    mib[0] = CTL_HW;
+    mib[1] = HW_NCPU;
+    if (sysctl(mib, 2, &count, &len, NULL, 0) == 0 && count > 0) {
+        return (int)count;
+    } else {
+        return 1;
+    }
 #endif
+}
+
+
+#endif /* COMMON_H */

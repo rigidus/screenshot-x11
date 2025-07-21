@@ -25,11 +25,6 @@
     int pthread_join(pthread_t thread, void **retval);
     long sysconf(int name);
     int sched_yield(void);
-
-    // хотел утащить в windows.с но не понял как
-    #ifndef _SC_NPROCESSORS_ONLN
-        #define _SC_NPROCESSORS_ONLN 4
-    #endif
 #endif
 
 #include <math.h>
@@ -316,7 +311,7 @@ int main(int argc, char **argv) {
     }
 
     // Определяем число рабочих потоков
-    long cores = sysconf(_SC_NPROCESSORS_ONLN);
+    int cores = get_num_cores();
     g.workers = (cores > 4) ? cores - 3 : 1;
 
     // Инициализация платформы для захвата скриншотов
