@@ -1,75 +1,56 @@
-CC     := gcc
-CFLAGS := -O3 -std=c17 -Wall -Wextra -pedantic -D_GNU_SOURCE -msse4.1
-LIBPNG := -lpng
+CC      := gcc
+CFLAGS  := -O3 -std=c17 -Wall -Wextra -pedantic -D_GNU_SOURCE -msse4.1
+LIBPNG  := -lpng
+SRCPATH := screenshot
+BIN     := xcape_pipe
 
-# Определение платформы
 ifeq ($(OS),Windows_NT)
-    PLATFORM := windows
-    PLATFORM_LIBS := -lgdi32 -luser32 -lkernel32
-    XLIBS :=
-    EXE_SUFFIX := .exe
-    PLATFORM_DEF := -DPLATFORM_WINDOWS
+    PLATFORM       := windows
+	PLATFORM_SRC   := $(SRCPATH)/windows.c
+    PLATFORM_LIBS  := -lgdi32 -luser32 -lkernel32 $(LIBPNG)
+    XLIBS          :=
+    EXE_SUFFIX     := .exe
+    PLATFORM_DEF   := -DPLATFORM_WINDOWS
+    PLATFORM_CFLAGS := $(CFLAGS) $(PLATFORM_DEF) -mconsole -I$(SRCPATH)
 else
     UNAME_S := $(shell uname -s)
-    ifeq ($(UNAME_S),Linux)
-        PLATFORM := linux
-        PLATFORM_LIBS := -lX11 -lXext -lnuma -lpthread
-        XLIBS := -lX11 -lXext
-        EXE_SUFFIX :=
-        PLATFORM_DEF := -DPLATFORM_LINUX
+    ifeq ($(UNAME_S),Darwin)
+        PLATFORM       := macos
+		PLATFORM_SRC   := $(SRCPATH)/linux.c
+        PLATFORM_LIBS  := -framework Cocoa -framework QuartzCore $(LIBPNG)
+        XLIBS          :=
+        EXE_SUFFIX     :=
+        PLATFORM_DEF   := -DPLATFORM_MACOS
+        PLATFORM_CFLAGS := $(CFLAGS) $(PLATFORM_DEF) -I$(SRCPATH)
+    else ifeq ($(UNAME_S),Linux)
+        PLATFORM       := linux
+		PLATFORM_SRC   := $(SRCPATH)/linux.c
+        PLATFORM_LIBS  := -lX11 -lXext -lnuma -lpthread $(LIBPNG)
+        XLIBS          := -lX11 -lXext
+        EXE_SUFFIX     :=
+        PLATFORM_DEF   := -DPLATFORM_LINUX
+        PLATFORM_CFLAGS := $(CFLAGS) $(PLATFORM_DEF) -I$(SRCPATH) -pthread
+    else
+        $(error Unsupported platform: $(UNAME_S))
     endif
 endif
 
-SRC    := src
-XCAPE_SRC := screenshot
-BIN    := capture invert linefinder rectfinder rectfinder2 cclfinder cclfinder16 rectfinder_top15 xcape_pipe viewer
 
-CXX ?= g++
+COMMON      := xcape_pipe.c processing.c debug.c common.h
+COMMON_SRCS := $(addprefix $(SRCPATH)/,$(COMMON))
 
-OPENCV_CFLAGS := $(shell pkg-config --cflags opencv4)
-OPENCV_LIBS   := $(shell pkg-config --libs   opencv4)
 
-capture:   $(SRC)/capture.c
-	$(CC) $(CFLAGS) $< -o $@$(EXE_SUFFIX) $(XLIBS) $(LIBPNG)
-
-invert:    $(SRC)/invert.c
-	$(CC) $(CFLAGS) $< -o $@$(EXE_SUFFIX) $(LIBPNG)
-
-linefinder: $(SRC)/linefinder.c
-	$(CC) $(CFLAGS) $< -o $@$(EXE_SUFFIX) $(LIBPNG)
-
-rectfinder: src/rectfinder.c
-	$(CC) $(CFLAGS) $< -o $@$(EXE_SUFFIX) $(LIBPNG)
-
-rectfinder2: src/rectfinder2.c
-	$(CC) $(CFLAGS) $< -o $@$(EXE_SUFFIX) $(LIBPNG)
-
-cclfinder: src/cclfinder.cpp
-	$(CXX) $(CFLAGS) $(OPENCV_CFLAGS) $< -o $@$(EXE_SUFFIX) $(OPENCV_LIBS)
-
-cclfinder16: src/cclfinder16.cpp
-	$(CXX) $(CFLAGS) $(OPENCV_CFLAGS) $< -o $@$(EXE_SUFFIX) $(OPENCV_LIBS)
-
-rectfinder_top15: src/rectfinder_top15.cpp
-	$(CXX) $(CFLAGS) $(OPENCV_CFLAGS) $< -o $@$(EXE_SUFFIX) $(OPENCV_LIBS)
-
-# Кроссплатформенная сборка xcape_pipe
-xcape_pipe: $(XCAPE_SRC)/xcape_pipe.c $(XCAPE_SRC)/processing.c $(XCAPE_SRC)/debug.c $(XCAPE_SRC)/common.h
-ifeq ($(PLATFORM),windows)
-	$(CC) $(CFLAGS) $(PLATFORM_DEF) -mconsole -I$(XCAPE_SRC) \
-		$(XCAPE_SRC)/xcape_pipe.c $(XCAPE_SRC)/processing.c $(XCAPE_SRC)/debug.c $(XCAPE_SRC)/windows.c \
-		$(PLATFORM_LIBS) $(LIBPNG) -o $@$(EXE_SUFFIX)
-else
-	$(CC) $(CFLAGS) $(PLATFORM_DEF) -I$(XCAPE_SRC) -pthread \
-		$(XCAPE_SRC)/xcape_pipe.c $(XCAPE_SRC)/processing.c $(XCAPE_SRC)/debug.c $(XCAPE_SRC)/linux.c \
-		$(PLATFORM_LIBS) $(LIBPNG) -o $@$(EXE_SUFFIX)
-endif
-
-viewer: src/viewer.c
-	gcc -O2 -std=c17 -Wall -Wextra $< -lpng -o $@$(EXE_SUFFIX)
+# теперь цель зависит от «общих» + одного платформенного
+xcape_pipe: $(COMMON_SRCS) $(PLATFORM_SRC)
+	$(CC) \
+		$(PLATFORM_CFLAGS) \
+		$(COMMON_SRCS) \
+		$(PLATFORM_SRC) \
+		$(PLATFORM_LIBS) \
+		-o $@$(EXE_SUFFIX)
 
 clean:
-	rm -f $(BIN) frame_*.png *_*.png
+	rm -f $(BIN) frame_*.png *_*.png *.bmp
 	rm qimg_*
 	rm dbg_*
 
