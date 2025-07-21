@@ -20,7 +20,7 @@
     // pthread функции определены в windows.c
     typedef void* pthread_t;
     typedef struct { int dummy; } pthread_attr_t;
-    
+
     int pthread_create(pthread_t *thread, const pthread_attr_t *attr, void *(*start_routine)(void*), void *arg);
     int pthread_join(pthread_t thread, void **retval);
     long sysconf(int name);
@@ -109,7 +109,7 @@ static void *capture_thread(void *arg) {
         next += period;
 
         FrameSlot *s = &g.slot[idx];
-        
+
         // Если слот занят — дропаем и идём дальше
         if (atomic_load_explicit(&s->st, memory_order_acquire) != FREE) {
             printf("[drop] slot %u busy\n", idx);
@@ -142,14 +142,14 @@ static void *worker_thread(void *arg) {
 
     while (1) {
         bool found = false;
-        
+
         for (uint32_t i = 0; i < g.slots; ++i) {
             FrameSlot *s = &g.slot[i];
             enum slot_state expected = RAW_READY;
-            
+
             if (atomic_compare_exchange_strong(&s->st, &expected, IN_PROGRESS)) {
                 printf("[worker %u] Processing slot %u\n", worker_id, i);
-                
+
                 // === Квантование RGB332 + анализ uniform-блоков 32×32
                 quantize_and_analyze(s, &g);
 
@@ -165,19 +165,19 @@ static void *worker_thread(void *arg) {
                     atomic_store_explicit(&s->st, FREE, memory_order_release);
                     continue;
                 }
-                
+
                 for (int j = 0; j < bc; ++j) {
                     block_color[j] = (s->fg[j] ^ s->bg[j]) ? MIXED : 0;
                 }
-                
+
                 int region_n;
-                Region *regions = detect_regions(s->mask, block_color,
+                OcrRegion *regions = detect_regions(s->mask, block_color,
                                                 g.block_rows, g.block_cols,
                                                 &region_n);
 
                 // Фильтруем слишком большие регионы (>32×32)
                 int small_n = 0;
-                Region *small = malloc(region_n * sizeof(Region));
+                OcrRegion *small = malloc(region_n * sizeof(OcrRegion));
                 if (small && regions) {
                     for (int r = 0; r < region_n; r++) {
                         int w = regions[r].maxx - regions[r].minx + 1;
@@ -210,7 +210,7 @@ static void *worker_thread(void *arg) {
                     group_regions(regions, region_n, &lines, &line_n);
                     if (lines) {
                         debug_dump_lines(i, lines, line_n, &g);
-                        
+
                         // Освобождаем память строк
                         for (int l = 0; l < line_n; l++) {
                             free(lines[l].regions);
@@ -224,7 +224,7 @@ static void *worker_thread(void *arg) {
                     }
                     free(regions);
                 }
-                
+
                 free(block_color);
 
                 // Переводим в состояние готовности к сериализации
@@ -234,45 +234,45 @@ static void *worker_thread(void *arg) {
                 break;
             }
         }
-        
+
         if (!found) {
             sched_yield();
         }
     }
-    
+
     return NULL;
 }
 
 static void *serializer_thread(void *arg) {
     (void)arg;
     printf("[serializer] Serializer thread started\n");
-    
+
     while (1) {
         bool found = false;
-        
+
         for (uint32_t i = 0; i < g.slots; ++i) {
             FrameSlot *s = &g.slot[i];
             enum slot_state expected = QUANT_DONE;
-            
+
             if (atomic_compare_exchange_strong(&s->st, &expected, SERIALIZING)) {
                 printf("[serializer] Found slot %u ready for serialization\n", i);
-                
+
                 // Создаем имя файла для обработанного скриншота
                 char bmp_filename[256];
 #ifdef PLATFORM_WINDOWS
                 char *temp_dir = getenv("TEMP");
                 if (temp_dir) {
-                    snprintf(bmp_filename, sizeof(bmp_filename), "%s\\screenshot_processed_%llu.bmp", 
+                    snprintf(bmp_filename, sizeof(bmp_filename), "%s\\screenshot_processed_%llu.bmp",
                              temp_dir, (unsigned long long)s->t_start);
                 } else {
-                    snprintf(bmp_filename, sizeof(bmp_filename), "screenshot_processed_%llu.bmp", 
+                    snprintf(bmp_filename, sizeof(bmp_filename), "screenshot_processed_%llu.bmp",
                              (unsigned long long)s->t_start);
                 }
 #else
-                snprintf(bmp_filename, sizeof(bmp_filename), "/tmp/screenshot_processed_%llu.bmp", 
+                snprintf(bmp_filename, sizeof(bmp_filename), "/tmp/screenshot_processed_%llu.bmp",
                          (unsigned long long)s->t_start);
 #endif
-                
+
                 // Сохраняем скриншот
                 if (s->rgba) {
                     printf("[serializer] Saving processed file: %s\n", bmp_filename);
@@ -281,10 +281,10 @@ static void *serializer_thread(void *arg) {
                 } else {
                     printf("[serializer] Warning: no RGBA data in slot %u\n", i);
                 }
-                
-                printf("[serializer] Processing slot %u completed (time: %llu ns)\n", 
+
+                printf("[serializer] Processing slot %u completed (time: %llu ns)\n",
                        i, (unsigned long long)(now_ns() - s->t_start));
-                
+
                 // Освобождаем слот
                 atomic_store_explicit(&s->st, FREE, memory_order_release);
                 printf("[serializer] Slot %u freed\n", i);
@@ -292,12 +292,12 @@ static void *serializer_thread(void *arg) {
                 break;
             }
         }
-        
+
         if (!found) {
             sched_yield();
         }
     }
-    
+
     return NULL;
 }
 

@@ -3,6 +3,7 @@
 #include "common.h"
 #include <X11/Xlib.h>
 #include <X11/extensions/XShm.h>
+#include <X11/Xutil.h>
 #include <sys/shm.h>
 #include <sys/time.h>
 #include <unistd.h>
@@ -24,9 +25,9 @@ typedef struct {
 bool platform_init(GlobalContext *ctx) {
     LinuxPlatformData *pdata = malloc(sizeof(LinuxPlatformData));
     if (!pdata) return false;
-    
+
     ctx->platform_data = pdata;
-    
+
     if (!XInitThreads()) {
         free(pdata);
         return false;
@@ -42,7 +43,7 @@ bool platform_init(GlobalContext *ctx) {
     pdata->root = RootWindow(pdata->dpy, scr);
     ctx->w = DisplayWidth(pdata->dpy, scr);
     ctx->h = DisplayHeight(pdata->dpy, scr);
-    
+
     if (!XShmQueryExtension(pdata->dpy)) {
         XCloseDisplay(pdata->dpy);
         free(pdata);
@@ -98,7 +99,7 @@ bool platform_init(GlobalContext *ctx) {
             return false;
         }
     }
-    
+
     XSync(pdata->dpy, False);
     printf("[init] Linux X11 %dx%d\n", ctx->w, ctx->h);
     return true;
@@ -106,9 +107,9 @@ bool platform_init(GlobalContext *ctx) {
 
 void platform_cleanup(GlobalContext *ctx) {
     if (!ctx->platform_data) return;
-    
+
     LinuxPlatformData *pdata = (LinuxPlatformData*)ctx->platform_data;
-    
+
     for (uint32_t i = 0; i < ctx->slots; ++i) {
         if (pdata->ximg[i]) {
             XShmDetach(pdata->dpy, &pdata->shm[i]);
@@ -117,25 +118,25 @@ void platform_cleanup(GlobalContext *ctx) {
             XDestroyImage(pdata->ximg[i]);
         }
     }
-    
+
     if (pdata->dpy) {
         XCloseDisplay(pdata->dpy);
     }
-    
+
     free(pdata);
     ctx->platform_data = NULL;
 }
 
 bool platform_capture_screen(GlobalContext *ctx, int slot_index) {
     LinuxPlatformData *pdata = (LinuxPlatformData*)ctx->platform_data;
-    
+
     if (!XShmGetImage(pdata->dpy, pdata->root, pdata->ximg[slot_index], 0, 0, AllPlanes)) {
         return false;
     }
-    
+
     // Устанавливаем указатель на raw данные (Linux уже RGBA)
     ctx->slot[slot_index].raw = (uint8_t*)pdata->ximg[slot_index]->data;
-    
+
     return true;
 }
 

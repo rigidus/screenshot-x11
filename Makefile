@@ -1,12 +1,12 @@
 CC     := gcc
-CFLAGS := -O3 -std=c17 -Wall -Wextra -pedantic
+CFLAGS := -O3 -std=c17 -Wall -Wextra -pedantic -D_GNU_SOURCE -msse4.1
 LIBPNG := -lpng
 
 # Определение платформы
 ifeq ($(OS),Windows_NT)
     PLATFORM := windows
     PLATFORM_LIBS := -lgdi32 -luser32 -lkernel32
-    XLIBS := 
+    XLIBS :=
     EXE_SUFFIX := .exe
     PLATFORM_DEF := -DPLATFORM_WINDOWS
 else
@@ -15,13 +15,13 @@ else
         PLATFORM := linux
         PLATFORM_LIBS := -lX11 -lXext -lnuma -lpthread
         XLIBS := -lX11 -lXext
-        EXE_SUFFIX := 
+        EXE_SUFFIX :=
         PLATFORM_DEF := -DPLATFORM_LINUX
     endif
 endif
 
 SRC    := src
-XCAPE_SRC := xcape_pipe
+XCAPE_SRC := screenshot
 BIN    := capture invert linefinder rectfinder rectfinder2 cclfinder cclfinder16 rectfinder_top15 xcape_pipe viewer
 
 CXX ?= g++

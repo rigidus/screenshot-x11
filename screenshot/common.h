@@ -12,14 +12,14 @@
 #include <math.h>
 #include <limits.h>
 #include <emmintrin.h>  // SSE2
-#include <immintrin.h>  // AVX2  
+#include <immintrin.h>  // AVX2
 #include <xmmintrin.h>  // SSE
 /* ========== Определение платформы ========== */
 #ifdef _WIN32
     #define PLATFORM_WINDOWS
     #include <windows.h>  // для QueryPerformanceCounter
 #elif defined(__linux__)
-    #define PLATFORM_LINUX
+    /* #define PLATFORM_LINUX */
     #include <numa.h>
 #else
     #error "Unsupported platform"
@@ -74,26 +74,26 @@ typedef struct {
 typedef struct {
     /* исходное разрешение экрана */
     int w, h;
-    
+
     /* разрешение с паддингом до кратности 32×32 */
     int padded_w, padded_h;
-    
+
     /* число блоков по горизонтали, вертикали и общее количество */
     int block_cols;
     int block_rows;
     int block_count;
-    
+
     /* число слотов и воркеров */
     uint32_t slots;
     uint32_t workers;
-    
+
     /* сами слоты для кадров */
     FrameSlot slot[MAX_SLOTS];
-    
+
     /* общая область под quant + color для всех слотов */
     uint8_t  *bigmem;
     size_t    bigmem_sz;
-    
+
     /* платформо-зависимые данные */
     void *platform_data;
 } GlobalContext;
@@ -103,15 +103,15 @@ typedef struct {
     uint8_t  dy, dx;  // pixel offsets inside block
 } Pixel;
 
-typedef struct Region {
+typedef struct OcrRegion {
     int minx, miny, maxx, maxy;  // bounding box in global pixels
     int count;                   // number of pixels in region
     Pixel *pixels;               // array of Pixel
-    struct Region *neighbor;     // next region on the right, or NULL
-} Region;
+    struct OcrRegion *neighbor;  // next region on the right, or NULL
+} OcrRegion;
 
 typedef struct {
-    Region **regions;  // указатели на регионы в этой строке
+    OcrRegion **regions;  // указатели на регионы в этой строке
     int      count;    // сколько регионов в строке
     int minx, miny, maxx, maxy; // computed bbox
 } Line;
@@ -141,9 +141,9 @@ static inline uint64_t now_ns(void) {
 #endif
 }
 
-static inline void die(const char *m) { 
-    perror(m); 
-    exit(EXIT_FAILURE); 
+static inline void die(const char *m) {
+    perror(m);
+    exit(EXIT_FAILURE);
 }
 
 // Цветовые утилиты
@@ -191,29 +191,29 @@ void dump_png_rgb(const char *fname, int W, int H, const uint8_t *rgb);
 bool block_uniform_avx2(const uint8_t *quant, int pw, int sy, int sx);
 
 // Обработка изображений
-Region* detect_regions(const uint8_t *mask, const uint8_t *block_color,
+OcrRegion* detect_regions(const uint8_t *mask, const uint8_t *block_color,
                        int block_rows, int block_cols, int *out_region_n);
-void group_regions(Region *regions, int region_n, Line **out_lines, int *out_line_n);
-void set_region_neighbors(Region *regions, int region_n);
+void group_regions(OcrRegion *regions, int region_n, Line **out_lines, int *out_line_n);
+void set_region_neighbors(OcrRegion *regions, int region_n);
 
 // Распознавание текста
-void render_region(const Region *reg, uint8_t *sample);
-char recognize_region(const Region *reg);
+void render_region(const OcrRegion *reg, uint8_t *sample);
+char recognize_region(const OcrRegion *reg);
 
 // Отладочные функции
 void debug_dump_quant(int slot, const uint8_t *quant, int padded_w, GlobalContext *ctx);
 void debug_dump_filled(int slot_idx, const FrameSlot *slot, GlobalContext *ctx);
-void debug_dump_regions(int slot_idx, const Region *regions, int region_n, GlobalContext *ctx);
-void debug_recognize(int slot_idx, Region *regions, int region_n);
+void debug_dump_regions(int slot_idx, const OcrRegion *regions, int region_n, GlobalContext *ctx);
+void debug_recognize(int slot_idx, OcrRegion *regions, int region_n);
 void debug_dump_lines(int slot_idx, Line *lines, int line_n, GlobalContext *ctx);
-void debug_dump_chains(int slot_idx, Region *regions, int region_n, GlobalContext *ctx);
+void debug_dump_chains(int slot_idx, OcrRegion *regions, int region_n, GlobalContext *ctx);
 void dump_rgba_as_bmp(const char *fname, int W, int H, const uint8_t *rgba);
 void dump_png_rgb(const char *fname, int W, int H, const uint8_t *rgb);
 
 // Утилиты
-static inline int popcount8(uint8_t v) { 
+static inline int popcount8(uint8_t v) {
 #ifdef __GNUC__
-    return __builtin_popcount(v); 
+    return __builtin_popcount(v);
 #else
     // Fallback implementation
     int count = 0;

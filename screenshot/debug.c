@@ -8,26 +8,26 @@ void dump_rgba_as_bmp(const char *fname, int W, int H, const uint8_t *rgba) {
         printf("[error] RGBA data is NULL!\n");
         return;
     }
-    
+
     FILE *fp = fopen(fname, "wb");
     if (!fp) {
         perror("dump_rgba_as_bmp: fopen");
         return;
     }
-    
+
     // BMP заголовок для 24-битного изображения
     uint32_t file_size = 54 + W * H * 3;
     uint32_t data_offset = 54;
     uint32_t header_size = 40;
     uint16_t planes = 1;
     uint16_t bits_per_pixel = 24;
-    
+
     // BMP File Header
     fwrite("BM", 1, 2, fp);  // Signature
     fwrite(&file_size, 4, 1, fp);
     fwrite("\0\0\0\0", 4, 1, fp);  // Reserved
     fwrite(&data_offset, 4, 1, fp);
-    
+
     // BMP Info Header
     fwrite(&header_size, 4, 1, fp);
     fwrite(&W, 4, 1, fp);
@@ -40,7 +40,7 @@ void dump_rgba_as_bmp(const char *fname, int W, int H, const uint8_t *rgba) {
     fwrite("\0\0\0\0", 4, 1, fp);  // Y pixels per meter
     fwrite("\0\0\0\0", 4, 1, fp);  // Colors used
     fwrite("\0\0\0\0", 4, 1, fp);  // Colors important
-    
+
     // Данные изображения (BMP хранит строки снизу вверх)
     // Конвертируем RGBA в BGR для BMP
     for (int y = H - 1; y >= 0; y--) {
@@ -50,7 +50,7 @@ void dump_rgba_as_bmp(const char *fname, int W, int H, const uint8_t *rgba) {
             fwrite(bgr, 3, 1, fp);
         }
     }
-    
+
     fclose(fp);
 }
 
@@ -71,7 +71,7 @@ void debug_dump_quant(int slot, const uint8_t *quant, int padded_w, GlobalContex
         printf("debug_dump_quant: malloc failed\n");
         return;
     }
-    
+
     for (int y = 0; y < ctx->h; ++y) {
         for (int x = 0; x < ctx->w; ++x) {
             uint8_t q = quant[y * padded_w + x];
@@ -83,9 +83,9 @@ void debug_dump_quant(int slot, const uint8_t *quant, int padded_w, GlobalContex
             rgb[idx*3+2] = b;
         }
     }
-    
+
     char fn[256];
-    struct timespec ts; 
+    struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     snprintf(fn, sizeof(fn), "dbg_quant_%d_%ld_%09ld.png",
              slot, ts.tv_sec, ts.tv_nsec);
@@ -103,9 +103,9 @@ static void dump_filled_blocks_png(const char *fname, const FrameSlot *slot, Glo
 
     // 1) Серый фон
     uint8_t *rgb = malloc((size_t)W * H * 3);
-    if (!rgb) { 
-        printf("dump_filled_blocks_png: malloc failed\n"); 
-        return; 
+    if (!rgb) {
+        printf("dump_filled_blocks_png: malloc failed\n");
+        return;
     }
     memset(rgb, 127, (size_t)W * H * 3);
 
@@ -211,14 +211,14 @@ void debug_dump_filled(int slot_idx, const FrameSlot *slot, GlobalContext *ctx) 
     dump_filled_blocks_png(fname, slot, ctx);
 }
 
-void debug_dump_regions(int slot_idx, const Region *regions, int region_n, GlobalContext *ctx) {
+void debug_dump_regions(int slot_idx, const OcrRegion *regions, int region_n, GlobalContext *ctx) {
     uint8_t *rgb = malloc((size_t)ctx->w * ctx->h * 3);
     if (!rgb) {
         printf("debug_dump_regions: malloc failed\n");
         return;
     }
     memset(rgb, 255, (size_t)ctx->w * ctx->h * 3);
-    
+
     // draw black pixels for regions
     for (int r = 0; r < region_n; ++r) {
         for (int i = 0; i < regions[r].count; ++i) {
@@ -231,7 +231,7 @@ void debug_dump_regions(int slot_idx, const Region *regions, int region_n, Globa
             }
         }
     }
-    
+
     // draw colored bounding boxes
     srand(slot_idx);
     for (int r = 0; r < region_n; ++r) {
@@ -242,7 +242,7 @@ void debug_dump_regions(int slot_idx, const Region *regions, int region_n, Globa
         int maxx = regions[r].maxx;
         int miny = regions[r].miny;
         int maxy = regions[r].maxy;
-        
+
         // горизонтальные линии
         for (int x = MAX(0, minx); x <= MIN(ctx->w-1, maxx); ++x) {
             if (miny >= 0 && miny < ctx->h) {
@@ -266,8 +266,8 @@ void debug_dump_regions(int slot_idx, const Region *regions, int region_n, Globa
             }
         }
     }
-    
-    char fn[256]; 
+
+    char fn[256];
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     snprintf(fn, sizeof(fn), "regions_%d_%ld.png", slot_idx, ts.tv_sec);
@@ -275,7 +275,7 @@ void debug_dump_regions(int slot_idx, const Region *regions, int region_n, Globa
     free(rgb);
 }
 
-void debug_recognize(int slot_idx, Region *regions, int region_n) {
+void debug_recognize(int slot_idx, OcrRegion *regions, int region_n) {
     for (int r = 0; r < region_n; ++r) {
         char c = recognize_region(&regions[r]);
         printf("slot %d, region %d: '%c'\n", slot_idx, r, c);
@@ -296,7 +296,7 @@ void debug_dump_lines(int slot_idx, Line *lines, int line_n, GlobalContext *ctx)
         uint8_t rr = rand() & 255;
         uint8_t gg = rand() & 255;
         uint8_t bb = rand() & 255;
-        
+
         // по периметру bbox
         for (int x = MAX(0, L->minx); x <= MIN(ctx->w-1, L->maxx); x++) {
             if (L->miny >= 0 && L->miny < ctx->h) {
@@ -328,7 +328,7 @@ void debug_dump_lines(int slot_idx, Line *lines, int line_n, GlobalContext *ctx)
     free(rgb);
 }
 
-void debug_dump_chains(int slot_idx, Region *regions, int region_n, GlobalContext *ctx) {
+void debug_dump_chains(int slot_idx, OcrRegion *regions, int region_n, GlobalContext *ctx) {
     uint8_t *rgb = malloc((size_t)ctx->w * ctx->h * 3);
     if (!rgb) {
         printf("debug_dump_chains: malloc failed\n");
@@ -338,7 +338,7 @@ void debug_dump_chains(int slot_idx, Region *regions, int region_n, GlobalContex
 
     // 1) Рисуем чёрные рамки вокруг каждого маленького региона
     for (int i = 0; i < region_n; i++) {
-        Region *r = &regions[i];
+        OcrRegion *r = &regions[i];
         int w = r->maxx - r->minx + 1;
         int h = r->maxy - r->miny + 1;
         if (w < 32 && h < 32) {
@@ -368,7 +368,7 @@ void debug_dump_chains(int slot_idx, Region *regions, int region_n, GlobalContex
     // 2) Помечаем все регионы, на которые кто-то ссылается как на neighbor
     bool *is_target = calloc(region_n, sizeof(bool));
     for (int i = 0; i < region_n; i++) {
-        Region *nbr = regions[i].neighbor;
+        OcrRegion *nbr = regions[i].neighbor;
         if (nbr) {
             int idx = (int)(nbr - regions);
             if (idx >= 0 && idx < region_n) {
@@ -380,12 +380,12 @@ void debug_dump_chains(int slot_idx, Region *regions, int region_n, GlobalContex
     // 3) Для каждого «головы» цепочки рисуем красную рамку вокруг общего bbox
     srand(slot_idx + 123);
     for (int i = 0; i < region_n; i++) {
-        Region *r0 = &regions[i];
+        OcrRegion *r0 = &regions[i];
         if (!is_target[i] && r0->neighbor) {
             int minx = r0->minx, miny = r0->miny;
             int maxx = r0->maxx, maxy = r0->maxy;
             // обходим цепочку
-            for (Region *cur = r0; cur; cur = cur->neighbor) {
+            for (OcrRegion *cur = r0; cur; cur = cur->neighbor) {
                 if (cur->minx < minx) minx = cur->minx;
                 if (cur->miny < miny) miny = cur->miny;
                 if (cur->maxx > maxx) maxx = cur->maxx;
@@ -418,7 +418,7 @@ void debug_dump_chains(int slot_idx, Region *regions, int region_n, GlobalContex
     free(is_target);
 
     // 4) Сохраняем
-    char fn[256]; 
+    char fn[256];
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     snprintf(fn, sizeof(fn), "chains_%d_%ld.png", slot_idx, ts.tv_sec);

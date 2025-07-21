@@ -24,20 +24,20 @@ int n_templates = sizeof(templates) / sizeof(templates[0]);
 void convert_bgr_to_rgba(const uint8_t *bgr_data, uint8_t *rgba_data, int width, int height) {
     // Конвертируем BGR (3 байта) в RGBA (4 байта)
     // BGR: [B][G][R] -> RGBA: [R][G][B][A]
-    
+
     const uint8_t *src = bgr_data;
     uint8_t *dst = rgba_data;
-    
+
     for (int i = 0; i < width * height; ++i) {
         uint8_t b = src[0];
-        uint8_t g = src[1]; 
+        uint8_t g = src[1];
         uint8_t r = src[2];
-        
+
         dst[0] = r;  // R
         dst[1] = g;  // G
         dst[2] = b;  // B
         dst[3] = 255; // A (полная непрозрачность)
-        
+
         src += 3;  // следующий BGR пиксель
         dst += 4;  // следующий RGBA пиксель
     }
@@ -49,7 +49,7 @@ void convert_bgr_to_rgba(const uint8_t *bgr_data, uint8_t *rgba_data, int width,
 bool block_uniform_avx2(const uint8_t *quant, int pw, int sy, int sx) {
     uint8_t base = quant[sy*pw + sx];
     if (base == 0) return true;  // весь блок из нулей
-    
+
 #if defined(__AVX2__) && (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86))
     __m256i v_base = _mm256_set1_epi8((char)base);
     __m256i v_zero = _mm256_setzero_si256();
@@ -77,7 +77,7 @@ bool block_uniform_avx2(const uint8_t *quant, int pw, int sy, int sx) {
 
 /* ========== Детекция связных регионов ========== */
 
-Region* detect_regions(const uint8_t *mask,
+OcrRegion* detect_regions(const uint8_t *mask,
                        const uint8_t *block_color,
                        int block_rows, int block_cols,
                        int *out_region_n) {
@@ -86,20 +86,20 @@ Region* detect_regions(const uint8_t *mask,
     bool *visited  = calloc(total_pix, sizeof(bool));
     Pixel *queue   = malloc(total_pix * sizeof(Pixel));
 
-    Region *regions = NULL;
+    OcrRegion *regions = NULL;
     int region_n = 0, region_cap = 0;
 
     for (int by = 0; by < block_rows; ++by) {
         for (int bx = 0; bx < block_cols; ++bx) {
             int bidx = by * block_cols + bx;
             if (block_color[bidx] != MIXED) continue;
-            
+
             const uint8_t *mask_block = mask + bidx * mask_bytes;
             for (int dy = 0; dy < BS; ++dy) {
                 for (int dx = 0; dx < BS; ++dx) {
                     int bit   = dy * BS + dx;
                     if (!(mask_block[bit>>3] & (1 << (bit&7)))) continue;
-                    
+
                     int local = (bidx * BS + dy) * BS + dx;
                     if (visited[local]) continue;
 
@@ -110,9 +110,9 @@ Region* detect_regions(const uint8_t *mask,
 
                     if (region_n == region_cap) {
                         region_cap = region_cap ? region_cap*2 : 8;
-                        regions = realloc(regions, region_cap * sizeof(Region));
+                        regions = realloc(regions, region_cap * sizeof(OcrRegion));
                     }
-                    Region *reg = &regions[region_n++];
+                    OcrRegion *reg = &regions[region_n++];
                     reg->count  = 0;
                     reg->pixels = NULL;
                     reg->neighbor = NULL;
@@ -170,25 +170,25 @@ Region* detect_regions(const uint8_t *mask,
 /* ========== Группировка регионов ========== */
 
 static int cmp_region_miny(const void *a, const void *b) {
-    const Region *r1 = *(Region**)a;
-    const Region *r2 = *(Region**)b;
+    const OcrRegion *r1 = *(OcrRegion**)a;
+    const OcrRegion *r2 = *(OcrRegion**)b;
     return r1->miny - r2->miny;
 }
 
 static int cmp_region_minx(const void *a, const void *b) {
-    const Region *r1 = *(Region**)a;
-    const Region *r2 = *(Region**)b;
+    const OcrRegion *r1 = *(OcrRegion**)a;
+    const OcrRegion *r2 = *(OcrRegion**)b;
     return r1->minx - r2->minx;
 }
 
-void group_regions(Region *regions, int region_n,
+void group_regions(OcrRegion *regions, int region_n,
                    Line **out_lines, int *out_line_n) {
     if (region_n == 0) { *out_lines = NULL; *out_line_n = 0; return; }
 
     // Собираем массив указателей и сортируем по miny
-    Region **arr = malloc(region_n * sizeof(Region*));
+    OcrRegion **arr = malloc(region_n * sizeof(OcrRegion*));
     for (int i = 0; i < region_n; i++) arr[i] = &regions[i];
-    qsort(arr, region_n, sizeof(Region*), cmp_region_miny);
+    qsort(arr, region_n, sizeof(OcrRegion*), cmp_region_miny);
 
     // Средняя высота региона
     float avg_h = 0;
@@ -203,10 +203,10 @@ void group_regions(Region *regions, int region_n,
 
     // Кластеризуем жадно
     for (int i = 0; i < region_n; i++) {
-        Region *r = arr[i];
+        OcrRegion *r = arr[i];
         if (line_n == 0) {
             lines = realloc(lines, sizeof(Line) * (line_n+1));
-            lines[line_n].regions = malloc(sizeof(Region*));
+            lines[line_n].regions = malloc(sizeof(OcrRegion*));
             lines[line_n].regions[0] = r;
             lines[line_n].count = 1;
             line_n++;
@@ -221,12 +221,12 @@ void group_regions(Region *regions, int region_n,
             }
             // если r лежит по-вертикали близко — добавляем в эту строку
             if (r->miny <= maxy + GAP) {
-                L->regions = realloc(L->regions, sizeof(Region*)*(L->count+1));
+                L->regions = realloc(L->regions, sizeof(OcrRegion*)*(L->count+1));
                 L->regions[L->count++] = r;
             } else {
                 // новая строка
                 lines = realloc(lines, sizeof(Line) * (line_n+1));
-                lines[line_n].regions = malloc(sizeof(Region*));
+                lines[line_n].regions = malloc(sizeof(OcrRegion*));
                 lines[line_n].regions[0] = r;
                 lines[line_n].count = 1;
                 line_n++;
@@ -237,14 +237,14 @@ void group_regions(Region *regions, int region_n,
     // внутри каждой строки сортируем по X и вычисляем bbox
     for (int i = 0; i < line_n; i++) {
         Line *L = &lines[i];
-        qsort(L->regions, L->count, sizeof(Region*), cmp_region_minx);
+        qsort(L->regions, L->count, sizeof(OcrRegion*), cmp_region_minx);
         // init bbox
         L->minx = L->regions[0]->minx;
         L->maxx = L->regions[0]->maxx;
         L->miny = L->regions[0]->miny;
         L->maxy = L->regions[0]->maxy;
         for (int j = 1; j < L->count; j++) {
-            Region *r = L->regions[j];
+            OcrRegion *r = L->regions[j];
             if (r->minx < L->minx) L->minx = r->minx;
             if (r->miny < L->miny) L->miny = r->miny;
             if (r->maxx > L->maxx) L->maxx = r->maxx;
@@ -257,14 +257,14 @@ void group_regions(Region *regions, int region_n,
     *out_line_n = line_n;
 }
 
-void set_region_neighbors(Region *regions, int region_n) {
+void set_region_neighbors(OcrRegion *regions, int region_n) {
     // Сброс всех ссылок
     for (int i = 0; i < region_n; i++) {
         regions[i].neighbor = NULL;
     }
 
     for (int i = 0; i < region_n; i++) {
-        Region *ri = &regions[i];
+        OcrRegion *ri = &regions[i];
         int wi = ri->maxx - ri->minx + 1;
         int hi = ri->maxy - ri->miny + 1;
         // только «маленькие» регионы
@@ -275,7 +275,7 @@ void set_region_neighbors(Region *regions, int region_n) {
 
         for (int j = 0; j < region_n; j++) {
             if (i == j) continue;
-            Region *rj = &regions[j];
+            OcrRegion *rj = &regions[j];
             int wj = rj->maxx - rj->minx + 1;
             int hj = rj->maxy - rj->miny + 1;
             if (wj >= BS || hj >= BS) continue;
@@ -302,7 +302,7 @@ void set_region_neighbors(Region *regions, int region_n) {
 
 /* ========== Распознавание текста ========== */
 
-void render_region(const Region *reg, uint8_t *sample) {
+void render_region(const OcrRegion *reg, uint8_t *sample) {
     memset(sample, 0, TEMPLATE_BYTES);
     for (int i = 0; i < reg->count; ++i) {
         Pixel p = reg->pixels[i];
@@ -317,7 +317,7 @@ void render_region(const Region *reg, uint8_t *sample) {
     }
 }
 
-char recognize_region(const Region *reg) {
+char recognize_region(const OcrRegion *reg) {
     uint8_t sample[TEMPLATE_BYTES];
     render_region(reg, sample);
     float best_score = 0.0f;
@@ -429,7 +429,7 @@ void quantize_and_analyze(FrameSlot *slot, GlobalContext *ctx) {
         }
     }
 
-    // Заполняем padding строки  
+    // Заполняем padding строки
     for (int y = H; y < ctx->padded_h; ++y) {
         uint8_t *row_q = slot->quant + (size_t)y * pw;
         memset(row_q, 0, pw);
@@ -454,7 +454,7 @@ void quantize_and_analyze(FrameSlot *slot, GlobalContext *ctx) {
             int w_blk = MIN(BS, W - x0);
             int h_blk = MIN(BS, H - y0);
             int total = w_blk * h_blk;
-            
+
             for (int dy = 0; dy < BS; ++dy) {
                 for (int dx = 0; dx < BS; ++dx) {
                     uint8_t q = slot->quant[(by*BS+dy)*pw + (bx*BS+dx)];
@@ -508,21 +508,21 @@ void dump_png_rgb(const char *fname, int W, int H, const uint8_t *rgb) {
     strcpy(bmp_fname, fname);
     char *ext = strstr(bmp_fname, ".png");
     if (ext) strcpy(ext, ".bmp");
-    
+
     // Конвертируем RGB в RGBA и сохраняем как BMP
     uint8_t *rgba = malloc((size_t)W * H * 4);
     if (!rgba) {
         printf("[error] Failed to allocate memory for RGBA conversion\n");
         return;
     }
-    
+
     for (int i = 0; i < W * H; i++) {
         rgba[i*4+0] = rgb[i*3+0]; // R
-        rgba[i*4+1] = rgb[i*3+1]; // G 
+        rgba[i*4+1] = rgb[i*3+1]; // G
         rgba[i*4+2] = rgb[i*3+2]; // B
         rgba[i*4+3] = 255;        // A
     }
-    
+
     dump_rgba_as_bmp(bmp_fname, W, H, rgba);
     free(rgba);
 }
