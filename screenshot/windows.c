@@ -79,7 +79,8 @@ int sched_yield(void) {
 
 void platform_quantize_bgr_to_rgb332(const uint8_t *bgr_data, uint8_t *quant_data,
                                       int width, int height, int padded_width) {
-    // Однократный детект SIMD возможностей
+
+    // SIMD detection (AVX2)
     static bool inited = false;
     static bool use256;
     if (!inited) {
@@ -88,22 +89,68 @@ void platform_quantize_bgr_to_rgb332(const uint8_t *bgr_data, uint8_t *quant_dat
         printf("[init] AVX2 support for BGR quantization: %s\n", use256 ? "yes" : "no");
     }
 
-    // Квантование BGR → RGB332
     for (int y = 0; y < height; ++y) {
-        const uint8_t *row_src = bgr_data + (size_t)y * width * 3;  // BGR (3 байта на пиксель)
+        // Получаем указатель на исходную строку BGR и выходную строку RGB332
+        const uint8_t *row_src = bgr_data + (size_t)y * width * 3;
         uint8_t *row_q = quant_data + (size_t)y * padded_width;
         int x = 0;
 
-        // Скалярная версия (BGR)
+#if defined(__AVX2__) && (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86))
+        // --- AVX2 ускорение ---
+        // Обрабатываем блоки по 8 пикселей (24 байта BGR -> 32 байта BGRX)
+        // Для каждого блока:
+        // 1. Копируем 8 BGR-пикселей во временный буфер BGRX (добавляем фиктивный байт X)
+        // 2. Загружаем буфер в AVX2-регистр
+        // 3. Извлекаем компоненты B, G, R через маски
+        // 4. Квантование: R3 = R>>5, G3 = G>>5, B2 = B>>6
+        // 5. Собираем RGB332: (R3<<5)|(G3<<2)|B2
+        // 6. Упаковываем результат в 8 байт и сохраняем в выходной буфер
+        int lim8 = (width/8)*8;
+        for (; x < lim8; x += 8) {
+            uint8_t bgrx[32];
+            for (int i = 0; i < 8; ++i) {
+                bgrx[i*4+0] = row_src[(x+i)*3+0]; // B
+                bgrx[i*4+1] = row_src[(x+i)*3+1]; // G
+                bgrx[i*4+2] = row_src[(x+i)*3+2]; // R
+                bgrx[i*4+3] = 0; // X (фиктивный)
+            }
+            __m256i pix = _mm256_loadu_si256((__m256i*)bgrx);
+            // Маски для извлечения компонент
+            __m256i maskB = _mm256_set1_epi32(0x000000FF);
+            __m256i maskG = _mm256_set1_epi32(0x0000FF00);
+            __m256i maskR = _mm256_set1_epi32(0x00FF0000);
+            // Извлекаем компоненты
+            __m256i B = _mm256_and_si256(pix, maskB);
+            __m256i G = _mm256_srli_epi32(_mm256_and_si256(pix, maskG), 8);
+            __m256i R = _mm256_srli_epi32(_mm256_and_si256(pix, maskR), 16);
+            // Квантование
+            __m256i R3 = _mm256_srli_epi32(R, 5);
+            __m256i G3 = _mm256_srli_epi32(G, 5);
+            __m256i B2 = _mm256_srli_epi32(B, 6);
+            // Собираем RGB332
+            __m256i rgb332 = _mm256_or_si256(_mm256_or_si256(_mm256_slli_epi32(R3,5), _mm256_slli_epi32(G3,2)), B2);
+            // Упаковываем 8 байт результата
+            __m128i lo = _mm256_castsi256_si128(rgb332);
+            __m128i hi = _mm256_extracti128_si256(rgb332, 1);
+            __m128i p16 = _mm_packus_epi32(lo, hi); // 8 x uint16_t
+            __m128i p8  = _mm_packus_epi16(p16, _mm_setzero_si128()); // 8 x uint8_t
+            // Сохраняем все 8 байт результата в выходной буфер
+            memcpy(row_q + x, &p8, 8);
+        }
+#endif
+
+        // --- Скалярная обработка ---
+        // Обрабатываем оставшиеся пиксели (если ширина не кратна 8)
         for (; x < width; ++x) {
-            uint8_t B = row_src[x*3+0];  // BGR
-            uint8_t G = row_src[x*3+1];
-            uint8_t R = row_src[x*3+2];
+            uint8_t B = row_src[x*3+0]; // B
+            uint8_t G = row_src[x*3+1]; // G
+            uint8_t R = row_src[x*3+2]; // R
+            // Квантование
             uint8_t R3 = R >> 5, G3 = G >> 5, B2 = B >> 6;
             row_q[x] = (uint8_t)((R3<<5)|(G3<<2)|B2);
         }
-
-        // Паддинг
+        // --- Паддинг ---
+        // Заполняем оставшиеся байты строки нулями
         for (; x < padded_width; ++x) {
             row_q[x] = 0;
         }
