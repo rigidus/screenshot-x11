@@ -5,7 +5,7 @@ void dump_png_rgb(const char *fname, int W, int H, const uint8_t *rgb) {
     // Создаем полный путь к файлу
     char full_path[MAX_SCREENSHOT_PATH];
     snprintf(full_path, sizeof(full_path), "%s%s", SCREENSHOT_PATH, fname);
-    
+
     // Конвертируем PNG в BMP для совместимости
     char bmp_fname[MAX_SCREENSHOT_PATH];
     strcpy(bmp_fname, full_path);
@@ -49,6 +49,15 @@ void dump_rgba_as_bmp(const char *fname, int W, int H, const uint8_t *rgba) {
     uint32_t file_size = 54 + W * H * 3;
     uint32_t data_offset = 54;
     uint32_t header_size = 40;
+
+    // BMP scanlines must be padded to 4-byte boundaries
+    int row_stride = (3 * W + 3) & ~3;
+    int padding    = row_stride - 3 * W;
+    static const uint8_t pad_bytes[3] = {0,0,0};
+
+    // Recompute file size including padding
+    file_size = 54 + (uint32_t)row_stride * H;
+
     uint16_t planes = 1;
     uint16_t bits_per_pixel = 24;
 
@@ -72,12 +81,16 @@ void dump_rgba_as_bmp(const char *fname, int W, int H, const uint8_t *rgba) {
     fwrite("\0\0\0\0", 4, 1, fp);  // Colors important
 
     // Данные изображения (BMP хранит строки снизу вверх)
-    // Конвертируем RGBA в BGR для BMP
-    for (int y = H - 1; y >= 0; y--) {
-        for (int x = 0; x < W; x++) {
-            const uint8_t *pixel = rgba + (y * W + x) * 4;
-            uint8_t bgr[3] = { pixel[2], pixel[1], pixel[0] };  // RGBA -> BGR
+
+    // Конвертируем RGBA в BGR для BMP, добавляя паддинг до 4-байтовой границы
+    for (int y = H - 1; y >= 0; --y) {
+        for (int x = 0; x < W; ++x) {
+            const uint8_t *pixel = rgba + (size_t)y * W * 4 + x * 4;
+            uint8_t bgr[3] = { pixel[2], pixel[1], pixel[0] };
             fwrite(bgr, 3, 1, fp);
+        }
+        if (padding) {
+            fwrite(pad_bytes, padding, 1, fp);
         }
     }
 
