@@ -1,23 +1,10 @@
 #include "common.h"
 
-/* ========== Вспомогательные функции путей ========== */
-
-void create_screenshot_path(char *full_path, size_t path_size, const char *filename) {
-    #ifdef PLATFORM_WINDOWS
-        // По умолчанию сохраняем в C:\Tmp
-        const char *screenshot_dir = "C:\\Tmp";
-        snprintf(full_path, path_size, "%s\\%s", screenshot_dir, filename);
-    #else
-        snprintf(full_path, path_size, "%s%s", SCREENSHOT_PATH, filename);
-    #endif
-}
-
 /* ========== Отладочные функции ========== */
-
 void dump_png_rgb(const char *fname, int W, int H, const uint8_t *rgb) {
     // Создаем полный путь к файлу
     char full_path[MAX_SCREENSHOT_PATH];
-    create_screenshot_path(full_path, sizeof(full_path), fname);
+    snprintf(full_path, sizeof(full_path), "%s%s", SCREENSHOT_PATH, fname);
     
     // Конвертируем PNG в BMP для совместимости
     char bmp_fname[MAX_SCREENSHOT_PATH];

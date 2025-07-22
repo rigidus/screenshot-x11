@@ -19,7 +19,7 @@ CharTemplate templates[] = {
 };
 int n_templates = sizeof(templates) / sizeof(templates[0]);
 
-/* ========== SIMD оптимизации (неиспользуемые в текущей версии) ========== */
+/* ========== SIMD оптимизации ========== */
 
 // SIMD‐проверка однородности 32-байтного региона
 bool block_uniform_avx2(const uint8_t *quant, int pw, int sy, int sx) {
