@@ -274,30 +274,22 @@ static void *serializer_thread(void *arg) {
 
 /* ========== Главная функция ========== */
 int main(int argc, char **argv) {
-    // Парсинг аргументов --slots=N
-    g.slots = DEFAULT_SLOTS;
-    for (int i = 1; i < argc; ++i) {
-        if (strncmp(argv[i], "--slots=", 8) == 0) {
-            int v = atoi(argv[i] + 8);
-            if (v < 1 || v > MAX_SLOTS) {
-                fprintf(stderr, "slots 1..%d\n", MAX_SLOTS);
-                return 1;
-            }
-            g.slots = v;
-        } else {
-            fprintf(stderr, "unknown option %s\n", argv[i]);
-            return 1;
-        }
+
+    int slots_arg = 0, workers_arg = 0;
+    if (parse_args(argc, argv, &slots_arg, &workers_arg) < 0) {
+        return 1;
     }
 
-    // Определяем число рабочих потоков
-    int cores = get_num_cores();
-    g.workers = (cores > 4) ? cores - 3 : 1;
-
-    // Инициализация платформы для захвата скриншотов
-    if (!platform_init(&g)) {
+    // Платформенная инициализация (вычислит кол-во слотов если неопределено)
+    if (!platform_init(&g, slots_arg)) {
         fprintf(stderr, "Failed to initialize platform\n");
         return 1;
+    }
+
+    if (workers_arg > 0) {
+        g.workers = workers_arg;
+    } else {
+        g.workers = calculate_workers();
     }
 
     // Вычисление размеров блоков 32×32 и паддинга
@@ -307,25 +299,31 @@ int main(int argc, char **argv) {
     g.padded_w    = g.block_cols * BS;
     g.padded_h    = g.block_rows * BS;
 
-    printf("[init] screen %dx%d, padded %dx%d, blocks %dx%d (%d total)\n",
+    printf("[main] screen %dx%d, padded %dx%d, blocks %dx%d (%d total)\n",
            g.w, g.h, g.padded_w, g.padded_h,
            g.block_cols, g.block_rows, g.block_count);
 
+    printf("[main] slots %dx, workers %d\n", g.slots, g.workers);
+
     // Аллокация больших буферов
     allocate_bigmem(&g);
+    printf("[main] bigmem allocated\n");
 
     // Запуск потоков: захват, обработка, сериализация
     pthread_t cap_tid, ser_tid;
     pthread_t *w_tids = calloc(g.workers, sizeof(pthread_t));
 
     pthread_create(&cap_tid, NULL, capture_thread, NULL);
+    printf("[main] capture_thread created\n");
     pthread_create(&ser_tid, NULL, serializer_thread, NULL);
+    printf("[main] serializer_thread created\n");
 
     for (uint32_t i = 0; i < g.workers; ++i) {
         pthread_create(&w_tids[i], NULL, worker_thread, (void*)(uintptr_t)i);
+        printf("[main] worker_thread %d created\n", i);
     }
 
-    printf("[init] Started %d worker threads\n", g.workers);
+    printf("[main] Started %d worker threads\n", g.workers);
 
     // Ждём потоков (на самом деле capture_thread бесконечен)
     pthread_join(cap_tid, NULL);

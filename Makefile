@@ -66,7 +66,7 @@ $(BIN)$(EXE_SUFFIX): $(COMMON_SRCS) $(PLATFORM_SRC)
 
 
 clean:
-	rm -f $(BIN)$(EXE_SUFFIX) frame_*.png *_*.png *.bmp qimg_* dbg_*
+	rm -f $(BIN)$(EXE_SUFFIX) frame_*.png *_*.png *.bmp qimg_* dbg_* tmp/*
 
 
 dbg:

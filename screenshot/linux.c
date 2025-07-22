@@ -22,8 +22,9 @@ typedef struct {
 
 /* ========== Linux квантизация ========== */
 
-void platform_quantize_rgba_to_rgb332(const uint8_t *rgba_data, uint8_t *quant_data, 
-                                       int width, int height, int padded_width, int bytes_per_line) {
+void platform_quantize_rgba_to_rgb332(
+    const uint8_t *rgba_data, uint8_t *quant_data,
+    int width, int height, int padded_width, int bytes_per_line) {
     // Однократный детект SIMD возможностей
     static bool inited = false;
     static bool use256;
@@ -94,7 +95,7 @@ void platform_quantize_rgba_to_rgb332(const uint8_t *rgba_data, uint8_t *quant_d
         }
     }
 
-    // Заполняем padding строки  
+    // Заполняем padding строки
     int block_rows = (height + BS - 1) / BS;
     int padded_height = block_rows * BS;
     for (int y = height; y < padded_height; ++y) {
@@ -109,7 +110,7 @@ void platform_quantize_rgba_to_rgb332(const uint8_t *rgba_data, uint8_t *quant_d
 
 /* ========== Реализация платформо-зависимых функций ========== */
 
-bool platform_init(GlobalContext *ctx) {
+bool platform_init(GlobalContext *ctx, int slots_arg) {
     LinuxPlatformData *pdata = malloc(sizeof(LinuxPlatformData));
     if (!pdata) return false;
 
@@ -131,6 +132,13 @@ bool platform_init(GlobalContext *ctx) {
     ctx->w = DisplayWidth(pdata->dpy, scr);
     ctx->h = DisplayHeight(pdata->dpy, scr);
 
+    // Если кол-во слотов не определено, вычисляем их автоматически
+    if (slots_arg > 0) {
+        ctx->slots = slots_arg;
+    } else {
+        ctx->slots = calculate_slots(ctx);
+    }
+
     if (!XShmQueryExtension(pdata->dpy)) {
         XCloseDisplay(pdata->dpy);
         free(pdata);
@@ -146,6 +154,11 @@ bool platform_init(GlobalContext *ctx) {
                                         ZPixmap,
                                         NULL, s,
                                         ctx->w, ctx->h);
+        printf("[init] XImage: depth=%d, bpp=%d, bytes_per_line=%d, byte_order=%s\n",
+               pdata->ximg[i]->depth,
+               pdata->ximg[i]->bits_per_pixel/8,
+               pdata->ximg[i]->bytes_per_line,
+               pdata->ximg[i]->byte_order == LSBFirst ? "LSB" : "MSB");
         if (!pdata->ximg[i]) {
             // Очистка уже созданных ресурсов
             for (uint32_t j = 0; j < i; ++j) {
@@ -227,7 +240,7 @@ bool platform_capture_screen(GlobalContext *ctx, int slot_index) {
     // Прямая квантизация RGBA → RGB332
     platform_quantize_rgba_to_rgb332((uint8_t*)pdata->ximg[slot_index]->data,
                                       ctx->slot[slot_index].quant,
-                                      ctx->w, ctx->h, ctx->padded_w, 
+                                      ctx->w, ctx->h, ctx->padded_w,
                                       pdata->ximg[slot_index]->bytes_per_line);
 
     return true;
