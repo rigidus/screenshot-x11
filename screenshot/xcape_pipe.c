@@ -252,23 +252,6 @@ static void *serializer_thread(void *arg) {
 
             if (atomic_compare_exchange_strong(&s->st, &expected, SERIALIZING)) {
                 printf("[serializer] Found slot %u ready for serialization\n", i);
-
-                // Создаем имя файла для обработанного скриншота
-                char bmp_filename[256];
-#ifdef PLATFORM_WINDOWS
-                char *temp_dir = getenv("TEMP");
-                if (temp_dir) {
-                    snprintf(bmp_filename, sizeof(bmp_filename), "%s\\screenshot_processed_%llu.bmp",
-                             temp_dir, (unsigned long long)s->t_start);
-                } else {
-                    snprintf(bmp_filename, sizeof(bmp_filename), "screenshot_processed_%llu.bmp",
-                             (unsigned long long)s->t_start);
-                }
-#else
-                snprintf(bmp_filename, sizeof(bmp_filename), "/tmp/screenshot_processed_%llu.bmp",
-                         (unsigned long long)s->t_start);
-#endif
-
                 // Сохраняем квантованное изображение как отладочную информацию
                 printf("[serializer] Saving processed quant data for slot %u\n", i);
                 debug_dump_quant(i, s->quant, g.padded_w, &g);
