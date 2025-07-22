@@ -27,9 +27,6 @@
     int sched_yield(void);
 #endif
 
-#include <math.h>
-#include <limits.h>
-
 /* ========== Глобальный контекст ========== */
 static GlobalContext g;
 
