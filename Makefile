@@ -9,7 +9,7 @@ BIN     := xcape_pipe
 
 ARCH := $(shell uname -m)
 ifeq ($(ARCH),x86_64)
-    SIMD_FLAGS := -msse4.1
+    SIMD_FLAGS := -msse4.1 -mavx2
 else
     SIMD_FLAGS :=
 endif
@@ -70,7 +70,7 @@ clean:
 
 
 dbg:
-	./xcape_pipe --slots=1
+	./xcape_pipe --slots=1 --workers=1
 
 
 all: $(BIN)$(EXE_SUFFIX)

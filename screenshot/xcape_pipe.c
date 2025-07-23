@@ -144,11 +144,11 @@ static void *worker_thread(void *arg) {
                 printf("[worker %u] Processing slot %u\n", worker_id, i);
 
                 // === Анализ uniform-блоков 32×32 ===
-                analyze_blocks(s, &g);
+                /* analyze_blocks(s, &g); */
 
                 // Отладочные дампы (включаем для проверки)
-                debug_dump_quant(i, s->quant, g.padded_w, &g);
-                debug_dump_filled(i, s, &g);
+                /* debug_dump_quant(i, s->quant, g.padded_w, &g); */
+                /* debug_dump_filled(i, s, &g); */
 
                 // build per-block color flags: MIXED if fg xor bg != 0
                 int bc = g.block_rows * g.block_cols;
@@ -326,13 +326,17 @@ int main(int argc, char **argv) {
     printf("[main] Started %d worker threads\n", g.workers);
 
     // Ждём потоков (на самом деле capture_thread бесконечен)
+    printf("[main] join capture thread\n");
     pthread_join(cap_tid, NULL);
+    printf("[main] join serialize thread\n");
     pthread_join(ser_tid, NULL);
+    printf("[main] join workers threads\n");
     for (uint32_t i = 0; i < g.workers; ++i) {
         pthread_join(w_tids[i], NULL);
     }
 
     // Очистка ресурсов
+    printf("[main] cleanup\n");
     if (g.bigmem) {
 #ifdef PLATFORM_LINUX
         munmap(g.bigmem, g.bigmem_sz);
@@ -343,5 +347,7 @@ int main(int argc, char **argv) {
     platform_cleanup(&g);
     free(w_tids);
 
+
+    printf("[main] exit\n");
     return 0;
 }

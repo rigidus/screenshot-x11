@@ -316,71 +316,71 @@ char recognize_region(const OcrRegion *reg) {
 
 /* ========== Функция анализа блоков ========== */
 
-void analyze_blocks(FrameSlot *slot, GlobalContext *ctx) {
-    const int W  = ctx->w;
-    const int H  = ctx->h;
-    const int pw = ctx->padded_w;
-    const int bc = ctx->block_cols;
-    const int br = ctx->block_rows;
-    const size_t mask_sz = ((size_t)BS * BS + 7) / 8;
+/* void analyze_blocks(FrameSlot *slot, GlobalContext *ctx) { */
+/*     const int W  = ctx->w; */
+/*     const int H  = ctx->h; */
+/*     const int pw = ctx->padded_w; */
+/*     const int bc = ctx->block_cols; */
+/*     const int br = ctx->block_rows; */
+/*     const size_t mask_sz = ((size_t)BS * BS + 7) / 8; */
 
-    // Анализ блоков 32×32 → bg/fg/mask
-    for (int by = 0; by < br; ++by) {
-        for (int bx = 0; bx < bc; ++bx) {
-            int idx = by*bc + bx;
-            uint8_t *bg = &slot->bg[idx];
-            uint8_t *fg = &slot->fg[idx];
-            uint8_t *m  = slot->mask + (size_t)idx*mask_sz;
+/*     // Анализ блоков 32×32 → bg/fg/mask */
+/*     for (int by = 0; by < br; ++by) { */
+/*         for (int bx = 0; bx < bc; ++bx) { */
+/*             int idx = by*bc + bx; */
+/*             uint8_t *bg = &slot->bg[idx]; */
+/*             uint8_t *fg = &slot->fg[idx]; */
+/*             uint8_t *m  = slot->mask + (size_t)idx*mask_sz; */
 
-            // собираем гистограмму
-            int hist[256] = {0};
-            int x0 = bx * BS;
-            int y0 = by * BS;
-            int w_blk = MIN(BS, W - x0);
-            int h_blk = MIN(BS, H - y0);
-            int total = w_blk * h_blk;
+/*             // собираем гистограмму */
+/*             int hist[256] = {0}; */
+/*             int x0 = bx * BS; */
+/*             int y0 = by * BS; */
+/*             int w_blk = MIN(BS, W - x0); */
+/*             int h_blk = MIN(BS, H - y0); */
+/*             int total = w_blk * h_blk; */
 
-            for (int dy = 0; dy < BS; ++dy) {
-                for (int dx = 0; dx < BS; ++dx) {
-                    uint8_t q = slot->quant[(by*BS+dy)*pw + (bx*BS+dx)];
-                    hist[q]++;
-                }
-            }
+/*             for (int dy = 0; dy < BS; ++dy) { */
+/*                 for (int dx = 0; dx < BS; ++dx) { */
+/*                     uint8_t q = slot->quant[(by*BS+dy)*pw + (bx*BS+dx)]; */
+/*                     hist[q]++; */
+/*                 } */
+/*             } */
 
-            // находим самый частый цвет
-            int best = 0;
-            for (int c = 1; c < 256; ++c)
-                if (hist[c] > hist[best]) best = c;
-            *bg = (uint8_t)best;
-            *fg = (uint8_t)best;
+/*             // находим самый частый цвет */
+/*             int best = 0; */
+/*             for (int c = 1; c < 256; ++c) */
+/*                 if (hist[c] > hist[best]) best = c; */
+/*             *bg = (uint8_t)best; */
+/*             *fg = (uint8_t)best; */
 
-            int second = -1, sc = -1;
-            if (hist[best] == total) {
-                // uniform — очистим маску
-                memset(m, 0, mask_sz);
-            } else {
-                // mixed — ищем второй по частоте
-                for (int c = 0; c < 256; ++c) {
-                    if (c == best) continue;
-                    if (hist[c] > sc) { sc = hist[c]; second = c; }
-                }
-                if (second < 0) {
-                    second = best;
-                    sc = -1;
-                }
-                *fg = (uint8_t)second;
+/*             int second = -1, sc = -1; */
+/*             if (hist[best] == total) { */
+/*                 // uniform — очистим маску */
+/*                 memset(m, 0, mask_sz); */
+/*             } else { */
+/*                 // mixed — ищем второй по частоте */
+/*                 for (int c = 0; c < 256; ++c) { */
+/*                     if (c == best) continue; */
+/*                     if (hist[c] > sc) { sc = hist[c]; second = c; } */
+/*                 } */
+/*                 if (second < 0) { */
+/*                     second = best; */
+/*                     sc = -1; */
+/*                 } */
+/*                 *fg = (uint8_t)second; */
 
-                // строим маску
-                memset(m, 0, mask_sz);
-                int bit = 0;
-                for (int dy = 0; dy < BS; ++dy) {
-                    for (int dx = 0; dx < BS; ++dx, ++bit) {
-                        uint8_t q = slot->quant[(by*BS+dy)*pw + (bx*BS+dx)];
-                        if (q != best)
-                            m[bit>>3] |= (uint8_t)(1u << (bit&7));
-                    }
-                }
-            }
-        }
-    }
-}
+/*                 // строим маску */
+/*                 memset(m, 0, mask_sz); */
+/*                 int bit = 0; */
+/*                 for (int dy = 0; dy < BS; ++dy) { */
+/*                     for (int dx = 0; dx < BS; ++dx, ++bit) { */
+/*                         uint8_t q = slot->quant[(by*BS+dy)*pw + (bx*BS+dx)]; */
+/*                         if (q != best) */
+/*                             m[bit>>3] |= (uint8_t)(1u << (bit&7)); */
+/*                     } */
+/*                 } */
+/*             } */
+/*         } */
+/*     } */
+/* } */

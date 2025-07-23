@@ -114,7 +114,7 @@
 #define COLOR_MIXED 0xFFFF
 #define STALL_NS 1000000000ull
 #define MAGIC_QIMG 0x51494D47u
-#define ALIGN_UP 128
+#define ALIGNMENT 128
 
 #ifndef MIN
 #define MIN(a,b) ((a) < (b) ? (a) : (b))
@@ -145,6 +145,9 @@ typedef struct {
 typedef struct {
     /* исходное разрешение экрана */
     int w, h;
+
+    // число байт в одной строке RGBA в сыром буфере
+    int stride_rgba;
 
     /* разрешение с паддингом до кратности 32×32 */
     int padded_w, padded_h;
@@ -235,7 +238,7 @@ static inline uint8_t expand3(uint8_t v) {
 
 // Выравнивание памяти
 static inline size_t align_up(size_t x) {
-    return (x + (ALIGN_UP - 1)) & ~(ALIGN_UP - 1);
+    return (x + (ALIGNMENT - 1)) & ~(ALIGNMENT - 1);
 }
 
 // SIMD проверки
@@ -260,12 +263,14 @@ bool platform_capture_screen(GlobalContext *ctx, int slot_index);
 // Platform-specific квантизация изображений
 void platform_quantize_bgr_to_rgb332(const uint8_t *bgr_data, uint8_t *quant_data,
                                       int width, int height, int padded_width);
-void platform_quantize_rgba_to_rgb332(const uint8_t *rgba_data, uint8_t *quant_data,
-                                       int width, int height, int padded_width, int bytes_per_line);
+/* void platform_quantize_rgba_to_rgb332(const uint8_t *rgba_data, uint8_t *quant_data, */
+/*                                        int width, int height, int padded_width, int bytes_per_line); */
+void quantize_and_analyze(const uint8_t *rgba, FrameSlot *slot, GlobalContext *ctx);
+
 
 // Объявления общих функций обработки
 void allocate_bigmem(GlobalContext *ctx);
-void analyze_blocks(FrameSlot *slot, GlobalContext *ctx);
+/* void analyze_blocks(FrameSlot *slot, GlobalContext *ctx); */
 void dump_png_rgb(const char *fname, int W, int H, const uint8_t *rgb);
 
 // Функции работы с путями
