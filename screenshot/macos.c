@@ -7,7 +7,7 @@ typedef struct {
     int dummy;
 } MacPlatformData;
 
-bool platform_init(GlobalContext *ctx) {
+bool platform_init(GlobalContext *ctx, int slots_arg) {
     MacPlatformData *pdata = malloc(sizeof(MacPlatformData));
     if (!pdata) return false;
     ctx->platform_data = pdata;
