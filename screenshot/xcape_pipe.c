@@ -6,6 +6,7 @@
  */
 
 #include "common.h"
+#include "glyphs.h"
 
 #ifdef PLATFORM_LINUX
     #include <pthread.h>
