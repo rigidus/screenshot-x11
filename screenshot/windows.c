@@ -171,7 +171,7 @@ void platform_quantize_bgr_to_rgb332(const uint8_t *bgr_data, uint8_t *quant_dat
 
 /* ========== Реализация платформо-зависимых функций ========== */
 
-bool platform_init(GlobalContext *ctx) {
+bool platform_init(GlobalContext *ctx, int slots_arg) {
     WindowsPlatformData *pdata = malloc(sizeof(WindowsPlatformData));
     if (!pdata) return false;
 
