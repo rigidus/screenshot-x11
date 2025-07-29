@@ -51,7 +51,7 @@ else
 endif
 
 
-COMMON      := xcape_pipe.c processing.c debug.c common.h
+COMMON      := xcape_pipe.c processing.c debug.c common.h glyphs.h glyphs.c
 COMMON_SRCS := $(addprefix $(SRCPATH)/,$(COMMON))
 
 

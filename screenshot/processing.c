@@ -1,12 +1,13 @@
 #include "common.h"
+#include "glyphs.h"
 
 #ifdef PLATFORM_LINUX
-    #include <pthread.h>
-    #include <sched.h>
-    #include <unistd.h>
-    #include <sys/stat.h>
-    #include <sys/mman.h>
-    #include <fcntl.h>
+#   include <pthread.h>
+#   include <sched.h>
+#   include <unistd.h>
+#   include <sys/stat.h>
+#   include <sys/mman.h>
+#   include <fcntl.h>
 #endif
 
 /* ========== Шаблоны символов ========== */
@@ -296,6 +297,28 @@ void render_region(const OcrRegion *reg, uint8_t *sample) {
 char recognize_region(const OcrRegion *reg) {
     uint8_t sample[TEMPLATE_BYTES];
     render_region(reg, sample);
+
+    // dump raw glyph bitmap before recognition
+    int rw = reg->maxx - reg->minx + 1;
+    int rh = reg->maxy - reg->miny + 1;
+    size_t nb = ((size_t)rw*rh + 7)/8;
+    uint8_t *bmp = malloc(nb);
+    if (bmp) {
+        memset(bmp,0,nb);
+        for (int i = 0; i < reg->count; ++i) {
+            Pixel p = reg->pixels[i];
+            int gx = p.bx*BS + p.dx;
+            int gy = p.by*BS + p.dy;
+            int rx = gx - reg->minx;
+            int ry = gy - reg->miny;
+            int bit = ry*rw + rx;
+            bmp[bit>>3] |= 1u << (bit&7);
+        }
+        save_glyph(bmp, rw, rh);
+        free(bmp);
+    }
+    // end of dump raw glyph bitmap
+
     float best_score = 0.0f;
     char  best_ch    = '?';
 

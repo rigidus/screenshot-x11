@@ -286,6 +286,8 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    init_glyphs_store();
+
     if (workers_arg > 0) {
         g.workers = workers_arg;
     } else {
