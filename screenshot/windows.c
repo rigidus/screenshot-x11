@@ -188,6 +188,13 @@ bool platform_init(GlobalContext *ctx, int slots_arg) {
     ctx->w = GetSystemMetrics(SM_CXSCREEN);
     ctx->h = GetSystemMetrics(SM_CYSCREEN);
 
+    // Если кол-во слотов не определено, вычисляем их автоматически
+    if (slots_arg > 0) {
+        ctx->slots = slots_arg;
+    } else {
+        ctx->slots = calculate_slots(ctx);
+    }
+
     // Настраиваем BITMAPINFO для 24-битного RGB
     memset(&pdata->bmi, 0, sizeof(pdata->bmi));
     pdata->bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
