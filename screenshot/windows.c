@@ -77,96 +77,259 @@ int sched_yield(void) {
 
 /* ========== Windows квантизация ========== */
 
-void platform_quantize_bgr_to_rgb332(const uint8_t *bgr_data, uint8_t *quant_data,
-                                      int width, int height, int padded_width) {
+/* void platform_quantize_bgr_to_rgb332(const uint8_t *bgr_data, uint8_t *quant_data, */
+/*                                       int width, int height, int padded_width) { */
 
-    // SIMD detection (AVX2)
-    static bool inited = false;
-    static bool use256;
-    if (!inited) {
-        use256 = cpu_has_avx2();
-        inited = true;
-        printf("[init] AVX2 support for BGR quantization: %s\n", use256 ? "yes" : "no");
+/*     // SIMD detection (AVX2) */
+/*     static bool inited = false; */
+/*     static bool use256; */
+/*     if (!inited) { */
+/*         use256 = cpu_has_avx2(); */
+/*         inited = true; */
+/*         printf("[init] AVX2 support for BGR quantization: %s\n", use256 ? "yes" : "no"); */
+/*     } */
+
+/*     for (int y = 0; y < height; ++y) { */
+/*         // Получаем указатель на исходную строку BGR и выходную строку RGB332 */
+/*         const uint8_t *row_src = bgr_data + (size_t)y * width * 3; */
+/*         uint8_t *row_q = quant_data + (size_t)y * padded_width; */
+/*         int x = 0; */
+
+/* #if defined(__AVX2__) && (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)) */
+/*         // --- AVX2 ускорение --- */
+/*         // Обрабатываем блоки по 8 пикселей (24 байта BGR -> 32 байта BGRX) */
+/*         // Для каждого блока: */
+/*         // 1. Копируем 8 BGR-пикселей во временный буфер BGRX (добавляем фиктивный байт X) */
+/*         // 2. Загружаем буфер в AVX2-регистр */
+/*         // 3. Извлекаем компоненты B, G, R через маски */
+/*         // 4. Квантование: R3 = R>>5, G3 = G>>5, B2 = B>>6 */
+/*         // 5. Собираем RGB332: (R3<<5)|(G3<<2)|B2 */
+/*         // 6. Упаковываем результат в 8 байт и сохраняем в выходной буфер */
+/*         int lim8 = (width/8)*8; */
+/*         for (; x < lim8; x += 8) { */
+/*             uint8_t bgrx[32]; */
+/*             for (int i = 0; i < 8; ++i) { */
+/*                 bgrx[i*4+0] = row_src[(x+i)*3+0]; // B */
+/*                 bgrx[i*4+1] = row_src[(x+i)*3+1]; // G */
+/*                 bgrx[i*4+2] = row_src[(x+i)*3+2]; // R */
+/*                 bgrx[i*4+3] = 0; // X (фиктивный) */
+/*             } */
+/*             __m256i pix = _mm256_loadu_si256((__m256i*)bgrx); */
+/*             // Маски для извлечения компонент */
+/*             __m256i maskB = _mm256_set1_epi32(0x000000FF); */
+/*             __m256i maskG = _mm256_set1_epi32(0x0000FF00); */
+/*             __m256i maskR = _mm256_set1_epi32(0x00FF0000); */
+/*             // Извлекаем компоненты */
+/*             __m256i B = _mm256_and_si256(pix, maskB); */
+/*             __m256i G = _mm256_srli_epi32(_mm256_and_si256(pix, maskG), 8); */
+/*             __m256i R = _mm256_srli_epi32(_mm256_and_si256(pix, maskR), 16); */
+/*             // Квантование */
+/*             __m256i R3 = _mm256_srli_epi32(R, 5); */
+/*             __m256i G3 = _mm256_srli_epi32(G, 5); */
+/*             __m256i B2 = _mm256_srli_epi32(B, 6); */
+/*             // Собираем RGB332 */
+/*             __m256i rgb332 = _mm256_or_si256(_mm256_or_si256(_mm256_slli_epi32(R3,5), _mm256_slli_epi32(G3,2)), B2); */
+/*             // Упаковываем 8 байт результата */
+/*             __m128i lo = _mm256_castsi256_si128(rgb332); */
+/*             __m128i hi = _mm256_extracti128_si256(rgb332, 1); */
+/*             __m128i p16 = _mm_packus_epi32(lo, hi); // 8 x uint16_t */
+/*             __m128i p8  = _mm_packus_epi16(p16, _mm_setzero_si128()); // 8 x uint8_t */
+/*             // Сохраняем все 8 байт результата в выходной буфер */
+/*             memcpy(row_q + x, &p8, 8); */
+/*         } */
+/* #endif */
+
+/*         // --- Скалярная обработка --- */
+/*         // Обрабатываем оставшиеся пиксели (если ширина не кратна 8) */
+/*         for (; x < width; ++x) { */
+/*             uint8_t B = row_src[x*3+0]; // B */
+/*             uint8_t G = row_src[x*3+1]; // G */
+/*             uint8_t R = row_src[x*3+2]; // R */
+/*             // Квантование */
+/*             uint8_t R3 = R >> 5, G3 = G >> 5, B2 = B >> 6; */
+/*             row_q[x] = (uint8_t)((R3<<5)|(G3<<2)|B2); */
+/*         } */
+/*         // --- Паддинг --- */
+/*         // Заполняем оставшиеся байты строки нулями */
+/*         for (; x < padded_width; ++x) { */
+/*             row_q[x] = 0; */
+/*         } */
+/*     } */
+
+/*     // Заполняем padding строки */
+/*     int block_rows = (height + BS - 1) / BS; */
+/*     int padded_height = block_rows * BS; */
+/*     for (int y = height; y < padded_height; ++y) { */
+/*         uint8_t *row_q = quant_data + (size_t)y * padded_width; */
+/*         memset(row_q, 0, padded_width); */
+/*     } */
+
+/* #ifdef __SSE2__ */
+/*     _mm_sfence();  // дождаться store */
+/* #endif */
+/* } */
+
+/**
+ * quantize_and_analyze — в одном проходе:
+ *  1) квантизация BGR0→RGB332 SIMD/скаляр
+ *  2) сбор гистограмм по блокам
+ *  3) заполнение fg/bg и маски сразу
+ *
+ * Выход:
+ *
+ * slot->quant — весь кадр в формате RGB332,
+ * slot->bg и slot->fg — массивы «фоновых» и «текстовых» цветов по 32×32,
+ * slot->mask — битовые маски смешанных блоков (1 бит на пиксель внутри блока).
+ *
+ */
+void quantize_and_analyze(
+    const uint8_t *rgba, FrameSlot *slot, GlobalContext *ctx)
+{
+    const int W  = ctx->w;
+    const int H  = ctx->h;
+    const int pw = ctx->padded_w;
+    const int stride_bytes = ctx->stride_rgba;
+    const int bc = ctx->block_cols;
+    const int br = ctx->block_rows;
+    const size_t mask_bytes = (BS*BS + 7) / 8;
+    const int total_blocks = bc * br;
+
+    // 1) Выделяем и обнуляем гистограммы размером [total_blocks][256],
+    // выровнено на 128 байт
+    int *hist;
+    if (posix_memalign(
+            (void**)&hist, ALIGNMENT,
+            sizeof(int) * 256 * total_blocks) != 0)
+    {
+        hist = malloc(sizeof(int) * 256 * total_blocks);
     }
+    memset(hist, 0, sizeof(int) * 256 * total_blocks);
 
-    for (int y = 0; y < height; ++y) {
-        // Получаем указатель на исходную строку BGR и выходную строку RGB332
-        const uint8_t *row_src = bgr_data + (size_t)y * width * 3;
-        uint8_t *row_q = quant_data + (size_t)y * padded_width;
+    // 2) Проход по кадру: квантование + сбор гистограмм
+    bool have_avx2 = cpu_has_avx2();
+
+    for (int y = 0; y < H; ++y) {
+        const uint8_t *row = rgba + (size_t)y * stride_bytes;
+        uint8_t       *qrow = slot->quant + (size_t)y * pw;
         int x = 0;
 
-#if defined(__AVX2__) && (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86))
-        // --- AVX2 ускорение ---
-        // Обрабатываем блоки по 8 пикселей (24 байта BGR -> 32 байта BGRX)
-        // Для каждого блока:
-        // 1. Копируем 8 BGR-пикселей во временный буфер BGRX (добавляем фиктивный байт X)
-        // 2. Загружаем буфер в AVX2-регистр
-        // 3. Извлекаем компоненты B, G, R через маски
-        // 4. Квантование: R3 = R>>5, G3 = G>>5, B2 = B>>6
-        // 5. Собираем RGB332: (R3<<5)|(G3<<2)|B2
-        // 6. Упаковываем результат в 8 байт и сохраняем в выходной буфер
-        int lim8 = (width/8)*8;
-        for (; x < lim8; x += 8) {
-            uint8_t bgrx[32];
-            for (int i = 0; i < 8; ++i) {
-                bgrx[i*4+0] = row_src[(x+i)*3+0]; // B
-                bgrx[i*4+1] = row_src[(x+i)*3+1]; // G
-                bgrx[i*4+2] = row_src[(x+i)*3+2]; // R
-                bgrx[i*4+3] = 0; // X (фиктивный)
+        // --- AVX2: по 8 пикселей за итерацию ---
+        if (have_avx2) {
+            __m256i mR = _mm256_set1_epi32(0xE0);
+            __m256i mB = _mm256_set1_epi32(0xC0);
+            int lim8 = (W / 8) * 8;
+            for (; x < lim8; x += 8) {
+                __m256i pix = _mm256_loadu_si256((__m256i*)(row + x*4));
+                __m256i r   = _mm256_and_si256(_mm256_srli_epi32(pix,16), mR);
+                __m256i g2  = _mm256_and_si256(_mm256_srli_epi32(pix, 8), mR);
+                __m256i b   = _mm256_and_si256(pix,               mB);
+                __m256i rg  = _mm256_or_si256(r, _mm256_srli_epi32(g2,3));
+                __m256i rgb = _mm256_or_si256(rg, _mm256_srli_epi32(b,6));
+                __m128i lo   = _mm256_castsi256_si128(rgb);
+                __m128i hi   = _mm256_extracti128_si256(rgb,1);
+                __m128i p16  = _mm_packus_epi32(lo, hi);
+                __m128i p8   = _mm_packus_epi16(p16, _mm_setzero_si128());
+                // unaligned store, т.к. qrow+x выровнен только на 8 байт
+                _mm_storeu_si128((__m128i*)(qrow + x), p8);
             }
-            __m256i pix = _mm256_loadu_si256((__m256i*)bgrx);
-            // Маски для извлечения компонент
-            __m256i maskB = _mm256_set1_epi32(0x000000FF);
-            __m256i maskG = _mm256_set1_epi32(0x0000FF00);
-            __m256i maskR = _mm256_set1_epi32(0x00FF0000);
-            // Извлекаем компоненты
-            __m256i B = _mm256_and_si256(pix, maskB);
-            __m256i G = _mm256_srli_epi32(_mm256_and_si256(pix, maskG), 8);
-            __m256i R = _mm256_srli_epi32(_mm256_and_si256(pix, maskR), 16);
-            // Квантование
-            __m256i R3 = _mm256_srli_epi32(R, 5);
-            __m256i G3 = _mm256_srli_epi32(G, 5);
-            __m256i B2 = _mm256_srli_epi32(B, 6);
-            // Собираем RGB332
-            __m256i rgb332 = _mm256_or_si256(_mm256_or_si256(_mm256_slli_epi32(R3,5), _mm256_slli_epi32(G3,2)), B2);
-            // Упаковываем 8 байт результата
-            __m128i lo = _mm256_castsi256_si128(rgb332);
-            __m128i hi = _mm256_extracti128_si256(rgb332, 1);
-            __m128i p16 = _mm_packus_epi32(lo, hi); // 8 x uint16_t
-            __m128i p8  = _mm_packus_epi16(p16, _mm_setzero_si128()); // 8 x uint8_t
-            // Сохраняем все 8 байт результата в выходной буфер
-            memcpy(row_q + x, &p8, 8);
         }
-#endif
 
-        // --- Скалярная обработка ---
-        // Обрабатываем оставшиеся пиксели (если ширина не кратна 8)
-        for (; x < width; ++x) {
-            uint8_t B = row_src[x*3+0]; // B
-            uint8_t G = row_src[x*3+1]; // G
-            uint8_t R = row_src[x*3+2]; // R
-            // Квантование
-            uint8_t R3 = R >> 5, G3 = G >> 5, B2 = B >> 6;
-            row_q[x] = (uint8_t)((R3<<5)|(G3<<2)|B2);
+        // --- SSE2 (или хвост после AVX2) по 4 пикселя ---
+        {
+            __m128i mR4 = _mm_set1_epi32(0xE0);
+            __m128i mB4 = _mm_set1_epi32(0xC0);
+            int lim4 = (W / 4) * 4;
+            for (; x < lim4; x += 4) {
+                __m128i pix = _mm_loadu_si128((__m128i*)(row + x*4));
+                __m128i r   = _mm_and_si128(_mm_srli_epi32(pix,16), mR4);
+                __m128i g2  = _mm_and_si128(_mm_srli_epi32(pix, 8), mR4);
+                __m128i b   = _mm_and_si128(pix,               mB4);
+                __m128i rg  = _mm_or_si128(r, _mm_srli_epi32(g2,3));
+                __m128i rgb = _mm_or_si128(rg, _mm_srli_epi32(b,6));
+                __m128i p16 = _mm_packus_epi32(rgb, _mm_setzero_si128());
+                __m128i p8  = _mm_packus_epi16(p16, _mm_setzero_si128());
+                *(uint32_t*)(qrow + x) = _mm_cvtsi128_si32(p8);
+            }
         }
-        // --- Паддинг ---
-        // Заполняем оставшиеся байты строки нулями
-        for (; x < padded_width; ++x) {
-            row_q[x] = 0;
+
+        // --- Скалярный хвост ---
+        for (; x < W; ++x) {
+            uint8_t R = row[x*4 + 0];
+            uint8_t G = row[x*4 + 1];
+            uint8_t B = row[x*4 + 2];
+            uint8_t r3 = R >> 5, g3 = G >> 5, b2 = B >> 6;
+            qrow[x] = (uint8_t)((r3<<5)|(g3<<2)|b2);
+        }
+
+        // --- Сбор гистограмм по блокам 32×32 ---
+        int by = y / BS;
+        for (int bx = 0; bx < bc; ++bx) {
+            int idx = by * bc + bx;
+            int x0  = bx * BS;
+            int x1  = x0 + BS;
+            if (x1 > W) x1 = W;
+            for (int xi = x0; xi < x1; ++xi) {
+                uint8_t v = qrow[xi];
+                hist[idx*256 + v]++;
+            }
         }
     }
 
-    // Заполняем padding строки
-    int block_rows = (height + BS - 1) / BS;
-    int padded_height = block_rows * BS;
-    for (int y = height; y < padded_height; ++y) {
-        uint8_t *row_q = quant_data + (size_t)y * padded_width;
-        memset(row_q, 0, padded_width);
+    // 3) Обработка каждого блока: bg, fg и маска
+    for (int by = 0; by < br; ++by) {
+        for (int bx = 0; bx < bc; ++bx) {
+            int idx = by * bc + bx;
+            int *h  = hist + idx*256;
+
+            // находим самый частый цвет
+            int best = 0;
+            for (int c = 1; c < 256; ++c)
+                if (h[c] > h[best]) best = c;
+            slot->bg[idx] = (uint8_t)best;
+
+            // ищем второй по частоте, если mixed
+            int total_pixels = MIN(BS, W - bx*BS)
+                * MIN(BS, H - by*BS);
+            int second = best, sc = -1;
+            if (h[best] != total_pixels) {
+                for (int c = 0; c < 256; ++c) {
+                    if (c == best) continue;
+                    if (h[c] > sc) { sc = h[c]; second = c; }
+                }
+            }
+            slot->fg[idx] = (uint8_t)second;
+
+            // строим битовую маску, читая из slot->quant
+            uint8_t *mask  = slot->mask + (size_t)idx * mask_bytes;
+            uint8_t *quant = slot->quant;
+            memset(mask, 0, mask_bytes);
+            if (second != best) {
+                int bit = 0;
+                for (int dy = 0; dy < BS; ++dy) {
+                    int y = by * BS + dy;
+                    if (y >= H) break;
+                    for (int dx = 0; dx < BS; ++dx, ++bit) {
+                        int x = bx * BS + dx;
+                        if (x < W) {
+                            uint8_t v = quant[(size_t)y * pw + x];
+                            if (v != best) {
+                                mask[bit>>3] |= (uint8_t)(1u << (bit&7));
+                            }
+                        }
+                    }
+                    // поправка, если блок выходит за границу по X
+                    if (bx*BS + BS > W) {
+                        bit += BS - (W - bx*BS);
+                    }
+                }
+            }
+        }
     }
 
-#ifdef __SSE2__
-    _mm_sfence();  // дождаться store
-#endif
+    // Гарантия завершения всех store-инструкций
+    _mm_sfence();
+
+    free(hist);
 }
 
 /* ========== Реализация платформо-зависимых функций ========== */
@@ -201,7 +364,7 @@ bool platform_init(GlobalContext *ctx, int slots_arg) {
     pdata->bmi.bmiHeader.biWidth = ctx->w;
     pdata->bmi.bmiHeader.biHeight = -ctx->h; // отрицательная высота для top-down DIB
     pdata->bmi.bmiHeader.biPlanes = 1;
-    pdata->bmi.bmiHeader.biBitCount = 24; // 24 бита на пиксель (RGB)
+    pdata->bmi.bmiHeader.biBitCount = 32; // 32 бита на пиксель (RGB)
     pdata->bmi.bmiHeader.biCompression = BI_RGB;
 
     // Создаем контексты памяти и битмапы для каждого слота
@@ -273,10 +436,8 @@ bool platform_capture_screen(GlobalContext *ctx, int slot_index) {
     // Устанавливаем указатель на raw данные для отладки
     ctx->slot[slot_index].raw = pdata->bitmap_data[slot_index];
 
-    // Прямая квантизация BGR → RGB332
-    platform_quantize_bgr_to_rgb332(pdata->bitmap_data[slot_index],
-                                     ctx->slot[slot_index].quant,
-                                     ctx->w, ctx->h, ctx->padded_w);
+    quantize_and_analyze((uint8_t*)pdata->ximg[slot_index]->data,
+                         &ctx->slot[slot_index], ctx);
 
     return true;
 }

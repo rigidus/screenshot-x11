@@ -267,7 +267,6 @@ void platform_quantize_bgr_to_rgb332(const uint8_t *bgr_data, uint8_t *quant_dat
 /*                                        int width, int height, int padded_width, int bytes_per_line); */
 void quantize_and_analyze(const uint8_t *rgba, FrameSlot *slot, GlobalContext *ctx);
 
-
 // Объявления общих функций обработки
 void allocate_bigmem(GlobalContext *ctx);
 /* void analyze_blocks(FrameSlot *slot, GlobalContext *ctx); */
