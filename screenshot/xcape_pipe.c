@@ -97,12 +97,8 @@ static void *capture_thread(void *arg) {
     while (1) {
         // Ждём до следующего кадра
         while (now_ns() < next) {
-#ifdef PLATFORM_WINDOWS
-            Sleep(1);  // Sleep на 1 миллисекунду
-#else
             struct timespec ts = { .tv_sec = 0, .tv_nsec = 1000000 };
             nanosleep(&ts, NULL);
-#endif
         }
         next += period;
 
