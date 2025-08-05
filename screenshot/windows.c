@@ -12,6 +12,7 @@
 #include "common.h"
 #include <windows.h>
 #include <wingdi.h>
+#include <malloc.h>  // для _aligned_malloc и _aligned_free
 
 #ifndef CLOCK_REALTIME
 #define CLOCK_REALTIME 0
@@ -196,12 +197,10 @@ void quantize_and_analyze(
 
     // 1) Выделяем и обнуляем гистограммы размером [total_blocks][256],
     // выровнено на 128 байт
-    int *hist;
-    if (posix_memalign(
-            (void**)&hist, ALIGNMENT,
-            sizeof(int) * 256 * total_blocks) != 0)
-    {
-        hist = malloc(sizeof(int) * 256 * total_blocks);
+    int *hist = malloc(sizeof(int) * 256 * total_blocks);
+    if (!hist) {
+        fprintf(stderr, "[error] Failed to allocate histogram\n");
+        return;
     }
     memset(hist, 0, sizeof(int) * 256 * total_blocks);
 
@@ -214,6 +213,7 @@ void quantize_and_analyze(
         int x = 0;
 
         // --- AVX2: по 8 пикселей за итерацию ---
+#if defined(__AVX2__) && (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86))
         if (have_avx2) {
             __m256i mR = _mm256_set1_epi32(0xE0);
             __m256i mB = _mm256_set1_epi32(0xC0);
@@ -233,6 +233,7 @@ void quantize_and_analyze(
                 _mm_storeu_si128((__m128i*)(qrow + x), p8);
             }
         }
+#endif
 
         // --- SSE2 (или хвост после AVX2) по 4 пикселя ---
         {
@@ -327,7 +328,9 @@ void quantize_and_analyze(
     }
 
     // Гарантия завершения всех store-инструкций
+#if defined(__SSE2__) || defined(_M_X64) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2)
     _mm_sfence();
+#endif
 
     free(hist);
 }
@@ -350,6 +353,9 @@ bool platform_init(GlobalContext *ctx, int slots_arg) {
     // Получаем размеры экрана
     ctx->w = GetSystemMetrics(SM_CXSCREEN);
     ctx->h = GetSystemMetrics(SM_CYSCREEN);
+
+    // Инициализируем stride для RGBA (32 бита на пиксель)
+    ctx->stride_rgba = ctx->w * 4;
 
     // Если кол-во слотов не определено, вычисляем их автоматически
     if (slots_arg > 0) {
@@ -436,7 +442,7 @@ bool platform_capture_screen(GlobalContext *ctx, int slot_index) {
     // Устанавливаем указатель на raw данные для отладки
     ctx->slot[slot_index].raw = pdata->bitmap_data[slot_index];
 
-    quantize_and_analyze((uint8_t*)pdata->ximg[slot_index]->data,
+    quantize_and_analyze((uint8_t*)pdata->bitmap_data[slot_index],
                          &ctx->slot[slot_index], ctx);
 
     return true;
